@@ -1273,12 +1273,38 @@ class MuseEngine:
             log.warning("取回附件 %s 失败: %s", name, exc)
         return None
 
-    def _report_turn(self, on_turn, base: int):
-        """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。"""
+    _ATT_DEBUG_JS = r"""(function(){
+      var scope=document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]')||document.body;
+      var n=[].slice.call(scope.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'));
+      return JSON.stringify(n.slice(-4).map(function(u){var m=u.querySelector('img,video');
+        return {tid:u.getAttribute('data-testid'),media:m?m.tagName:'',src:m?((m.currentSrc||m.src||'').slice(0,60)):'',
+                text:(u.innerText||'').trim().slice(0,40)};}));
+    })()"""
+
+    def _report_turn(self, on_turn, base: int, wait_media: bool = False):
+        """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。
+        wait_media=True（用户在要图/视频/文件）时，文字说完后附件可能还在生成，多等一会儿再取。"""
         if on_turn is None:
             return
         time.sleep(0.4)
         items = self._poll_turn()[base:]
+        if wait_media:
+            t_end = time.time() + 45.0
+            stable_since = time.time()
+            while time.time() < t_end:
+                has_media = any(i.get("k") in ("m", "f") for i in items)
+                if has_media and time.time() - stable_since >= 3.0:
+                    break
+                time.sleep(1.0)
+                cur = self._poll_turn()[base:]
+                if len(cur) != len(items):
+                    stable_since = time.time()
+                items = cur
+            log.info("等待附件结束，当前轮次共 %d 项", len(items))
+        try:
+            log.info("页面附件现状: %s", self.page.js(self._ATT_DEBUG_JS))
+        except Exception:  # noqa: BLE001
+            pass
         for it in items:
             if it.get("k") == "f":
                 it["data"] = self._fetch_attachment(it["idx"], it["name"])
@@ -1330,6 +1356,8 @@ class MuseEngine:
             prompt, fresh = self._enter_chat(account_id, prompt, fallback_prompt)
         else:
             self.reset_thread(for_chat=True)
+        want_media = bool(re.search(r"图|画|照片|海报|视频|文件|生成|导出|下载|image|picture|photo|video|file|draw|generate",
+                                    prompt or "", re.I))
         base_agent, base_text, _ = self._poll_chat()
         base_turn = len(self._poll_turn()) if on_turn is not None else 0
         self._send(prompt)
@@ -1402,12 +1430,12 @@ class MuseEngine:
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= (600 if on_turn is not None else 80):
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media)
                     return
 
         raise MuseGenerationError("等待助手回复超时")

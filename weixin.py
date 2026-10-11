@@ -354,6 +354,7 @@ class WeixinBot:
         except Exception as exc:  # noqa: BLE001
             log.exception("微信消息处理失败")
             replies = [("text", f"处理失败：{str(exc)[:200]}")]
+        log.info("微信回复 %s：%s", user[-6:], [(r[0], r[2] if r[0] == "media" else len(r[1])) for r in replies])
         for r in replies:
             try:
                 if r[0] == "text":
@@ -362,6 +363,7 @@ class WeixinBot:
                     with open(r[1], "rb") as f:
                         client.send_media(user, f.read(), r[2], ctx,
                                           name=os.path.basename(r[1]))
+                    log.info("微信已发送%s：%s", r[2], os.path.basename(r[1]))
             except Exception as exc:  # noqa: BLE001
                 log.warning("微信发送失败: %s", exc)
                 self.last_error = str(exc)[:200]
