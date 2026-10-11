@@ -279,15 +279,24 @@ class DirectClient:
             (".gif", "image/gif") if data[:4] == b"GIF8" else (".png", "image/png")
         sha = _h.sha256(data).hexdigest()
         path = f"workspace/user/media_library/image/{sha[:2]}/{sha}{ext}"
-        b64 = base64.b64encode(data).decode()
-        fill = {"data_base64": b64, "content_base64": b64, "offset": 0, "len": len(data),
-                "encoding": "base64", "create_dirs": True, "mkdirs": True, "overwrite": True,
-                "truncate": True, "append": False}
         try:
             self.gw.call_json("fs.mkdir", body={"path": os.path.dirname(path), "recursive": True})
         except Exception as exc:  # noqa: BLE001
             log.debug("fs.mkdir: %s", exc)
-        r = self._call_adaptive("fs.write", {"path": path, "data_base64": b64}, fill)
+        # 单个 Noise 帧最多 64KB，按 32KB 一段带 offset 分段写
+        piece = 32 * 1024
+        fields = None
+        r = None
+        for off in range(0, len(data), piece):
+            chunk = data[off:off + piece]
+            b64 = base64.b64encode(chunk).decode()
+            fill = {"data_base64": b64, "content_base64": b64, "offset": off, "len": len(chunk),
+                    "encoding": "base64", "create_dirs": True, "mkdirs": True, "overwrite": off == 0,
+                    "truncate": off == 0, "append": off > 0}
+            body = {k: fill[k] for k in fields} if fields else {"path": path, "data_base64": b64}
+            body["path"] = path
+            r = self._call_adaptive("fs.write", body, fill)
+            fields = [k for k in body if k != "path"]
         log.info("直连：图片已上传 %s（%d 字节）：%s", path[-30:], len(data), str(r)[:200])
         return {"path": path, "mime_type": mime, "filename": "image" + ext,
                 "bytes_len": len(data), "sha256": sha}
