@@ -368,13 +368,13 @@ class MuseEngine:
             time.sleep(0.08)
         return False
 
-    def reset_thread(self, for_chat: bool = False):
+    def reset_thread(self, for_chat: bool = False, keep_page: bool = False):
         """关闭残留弹窗并确保处于干净会话且 WebSocket 已就绪。
         对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。"""
         if not self.page:
             return
         try:
-            needs_nav = self.page.js("""(function(forChat){
+            needs_nav = self.page.js("""(function(forChat, keepPage){
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -389,11 +389,12 @@ class MuseEngine:
                 var bodyTxt = document.body ? (document.body.innerText || '') : '';
                 var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
                 if (hasStop || hasStuck || hasAtts) return true;
+                if (keepPage) return !document.querySelector('textarea');
                 if (forChat) {
                     return bubbleCount >= 24;
                 }
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
-            })(%s)""" % ("true" if for_chat else "false"))
+            })(%s, %s)""" % ("true" if for_chat else "false", "true" if keep_page else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
                 t_end = time.time() + 10.0
@@ -409,6 +410,35 @@ class MuseEngine:
                 self._wait_ws_ready(self.page, timeout=12.0)
         except Exception:
             pass
+
+    def open_main_chat(self) -> bool:
+        """切到 muse.ai 左侧栏的「主要聊天」（持续会话，历史由 muse 自己保存）。
+        找不到入口返回 False，调用方应回退到「新会话 + 拼历史」的老办法。"""
+        if not self.page:
+            return False
+        try:
+            clicked = self.page.js("""(function(){
+                var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
+                var els = document.querySelectorAll('a,button,[role="button"],[role="link"],div,span');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (el.children.length > 1) continue;
+                    if (re.test(el.innerText || '')) { el.click(); return true; }
+                }
+                return false;
+            })()""")
+            if not clicked:
+                return False
+            t_end = time.time() + 10.0
+            while time.time() < t_end:
+                time.sleep(0.1)
+                if self.page.js("!!document.querySelector('textarea')"):
+                    break
+            time.sleep(0.6)
+            self._wait_ws_ready(self.page, timeout=12.0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
@@ -941,11 +971,22 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, main_chat: bool = False,
+                    fallback_prompt: str | None = None):
+        """发一条消息，流式 yield 增量文本。
+
+        main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
+        进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        if main_chat:
+            self.reset_thread(for_chat=True, keep_page=True)
+            if not self.open_main_chat():
+                self.reset_thread(for_chat=True)
+                if fallback_prompt:
+                    prompt = fallback_prompt
+        else:
+            self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 

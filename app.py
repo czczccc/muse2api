@@ -308,7 +308,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     main_chat: bool = False, fallback_prompt: str | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -360,7 +361,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.start()
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            account_id=cur_id, stop_event=stop_event,
+                            main_chat=main_chat, fallback_prompt=fallback_prompt
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -2424,20 +2426,23 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 # ------------------------- 微信 ClawBot 接入 -------------------------
 WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
-           "/重置：清空对话上下文\n/帮助：显示本说明")
+           "/重置：清空本地上下文（muse 主要聊天里的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
 
 
 def _wx_chat(user: str, text: str) -> str:
+    """微信对话走 muse.ai 的「主要聊天」：只发新消息，上下文由 muse 自己记。
+    进不去主要聊天时，引擎会回退为新会话并改发带历史的 fallback_prompt。"""
     hist = _wx_history.setdefault(user, [])
     hist.append(ChatMessage(role="user", content=text))
     del hist[:-12]
-    prompt = build_chat_prompt(hist)
+    fallback = build_chat_prompt(hist)
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
-    out = "".join(safe_chat_stream(acc["cookies"], prompt, acc.get("cookies_exp"),
-                                   CFG.chat_timeout, account_id=acc["id"])).strip()
+    out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
+                                   CFG.chat_timeout, account_id=acc["id"],
+                                   main_chat=True, fallback_prompt=fallback)).strip()
     if out:
         hist.append(ChatMessage(role="assistant", content=out))
         del hist[:-12]
