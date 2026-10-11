@@ -84,44 +84,45 @@ async def check(source, home):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    import engine as engine_mod, routes_images, runner, state
     calls = []
     release = threading.Event()
-    media = Path(module.CFG.media_dir) / "fixture.png"
+    media = Path(state.CFG.media_dir) / "fixture.png"
     media.write_bytes(b"image fixture bytes")
 
     def generation(prompt, kind, timeout, **kwargs):
         calls.append((prompt, kind, timeout, kwargs.get("reference_image")))
         assert release.wait(2), "test worker not released"
         if "FAIL_FIXTURE" in prompt:
-            raise module.MuseGenerationError("fixture generation failed")
+            raise engine_mod.MuseGenerationError("fixture generation failed")
         return {"filename": media.name, "size": media.stat().st_size,
                 "kind": "image", "path": str(media)}, "fixture-account"
 
-    locked_impl = module._run_generation_locked if hasattr(module, "_run_generation_locked") else None
+    locked_impl = runner._run_generation_locked if hasattr(runner, "_run_generation_locked") else None
     if locked_impl:
         def assert_owned(*args, **kwargs):
-            assert module.GEN_LOCK.locked(), "browser lock must cover retry/cleanup"
+            assert runner.GEN_LOCK.locked(), "browser lock must cover retry/cleanup"
             assert kwargs.get("deadline") is not None
             return {"fixture": True}, None
-        module._run_generation_locked = assert_owned
-        module._run_generation("lock fixture", "image", 1)
-        module._run_generation_locked = locked_impl
-        assert not module.GEN_LOCK.locked()
-        real_lock = module.GEN_LOCK
+        runner._run_generation_locked = assert_owned
+        runner._run_generation("lock fixture", "image", 1)
+        runner._run_generation_locked = locked_impl
+        assert not runner.GEN_LOCK.locked()
+        real_lock = runner.GEN_LOCK
         class BusyLock:
             def acquire(self, timeout):
                 assert timeout == 1
                 return False
-        module.GEN_LOCK = BusyLock()
+        runner.GEN_LOCK = BusyLock()
         try:
-            module._run_generation("queue fixture", "image", 1)
+            runner._run_generation("queue fixture", "image", 1)
             raise AssertionError("busy browser must time out")
-        except module.MuseGenerationError:
+        except engine_mod.MuseGenerationError:
             pass
         finally:
-            module.GEN_LOCK = real_lock
+            runner.GEN_LOCK = real_lock
         print("generation_lock_covers_retry_cleanup=PASS queue_wait_bounded=PASS")
-    module._run_generation = generation
+    routes_images._run_generation = generation
     headers = {"Authorization": "Bearer test-only"}
     async with Client(module.app, headers) as client:
         # Old endpoint blocks until result; the new endpoint must acknowledge before release.
@@ -198,13 +199,13 @@ async def check(source, home):
         print("failure_terminal=PASS authentication=PASS missing_task=PASS")
 
         for _ in range(8):
-            module.store.create_task("image", "queued fixture")
+            state.store.create_task("image", "queued fixture")
         full = await client.post("/v1/images/tasks", json={"prompt": "queue full"})
         assert full.status_code == 429
         print("bounded_queue=PASS")
-        pending = module.store.create_task("image", "interrupted fixture")
+        pending = state.store.create_task("image", "interrupted fixture")
         await module._startup()
-        assert module.store.get_task(pending["id"])["status"] == "failed"
+        assert state.store.get_task(pending["id"])["status"] == "failed"
         print("restart_marks_interrupted_tasks_failed=PASS")
     print("PASS async image API regression")
 

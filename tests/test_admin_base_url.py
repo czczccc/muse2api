@@ -61,7 +61,7 @@ class Client:
 
 
 def build_cmd(base_url):
-    """admin.html:886"""
+    """同 /v1 后缀的剥离规则"""
     return re.sub(r"/v1/?$", "", base_url or "http://host:18610").rstrip("/")
 
 
@@ -69,7 +69,7 @@ async def check(source, home, public_base):
     os.environ.update(MUSE2API_HOME=home, MUSE2API_PROFILE_ROOT=home,
                       MUSE2API_KEY="test-only", MUSE2API_PUBLIC_BASE=public_base)
     sys.path.insert(0, str(source.parent))
-    for name in ("config", "store", "engine", "cdp"):
+    for name in ("config", "store", "engine", "cdp", "state", "schemas", "prompts", "runner", "keepalive", "routes_images", "routes_chat", "routes_admin", "wx_bridge", "weixin"):
         sys.modules.pop(name, None)          # config reads MUSE2API_* at import
     spec = importlib.util.spec_from_file_location("admin_base_url_test_target", source)
     module = importlib.util.module_from_spec(spec)
@@ -89,7 +89,7 @@ async def check(source, home, public_base):
         apikey = await client.get("/admin/apikey")
         expect(apikey.status_code == 200, "GET /admin/apikey failed")
 
-        # admin.html:1438 only writes #inBase when base_url is truthy
+        # base_url 仅在配置了 public_base 时才非空
         expect(bool(served["base_url"]) == bool(public_base),
                f"base_url={served['base_url']!r} for PUBLIC_BASE={public_base!r}")
         expect(served["base_url"] == apikey.json()["base_url"],
