@@ -217,7 +217,9 @@ def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
         ext = {"image": ".png", "video": ".mp4"}.get(kind, "")
         d = os.path.join(CFG.download_dir, "wx")
         os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, f"{uuid.uuid4().hex[:8]}_{_wx_safe_name(name) if name else 'file' + ext}")
+        sub = os.path.join(d, uuid.uuid4().hex[:8])       # 用子目录避免重名，文件名保持原样
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, _wx_safe_name(name) if name else "file" + ext)
         if kind != "file" and not os.path.splitext(path)[1]:
             path += ext
         with open(path, "wb") as f:

@@ -16,8 +16,9 @@ from state import log
 
 MAX_AGE = 20 * 60        # 连接复用的最长时间；hatch token 会过期，到点重连
 POLL = 0.6               # 轮询历史的间隔
+MEDIA_WAIT = 120         # 请求里要图/视频/文件、但还没收到附件时，最后一条文字后最多再等多久
 QUIET = 4.0              # 最后一条回复之后静默多久就认为这一轮结束
-NEEDS_BROWSER = re.compile(r"图|画|照片|海报|视频|文件|导出|下载|image|picture|photo|video|draw|file|download", re.I)
+NEEDS_BROWSER = re.compile(r"图|画|照片|海报|视频|文件|导出|下载|image|picture|photo|video|draw|file|download|\.py\b", re.I)
 
 
 def enabled() -> bool:
@@ -59,7 +60,7 @@ def _presentation_media(p: dict) -> list[dict]:
     """delta.presentation 里的图片：data.images[]，带 sandbox:// 路径和 variants.original 原图链接。"""
     out = []
     data = p.get("data") if isinstance(p.get("data"), dict) else {}
-    for key in ("images", "videos", "files", "image", "video", "file"):
+    for key in ("images", "videos", "files", "image", "video", "file", "media", "items"):
         vals = data.get(key)
         for im in (vals if isinstance(vals, list) else [vals] if isinstance(vals, dict) else []):
             if not isinstance(im, dict) or im.get("missing"):
@@ -278,6 +279,9 @@ class DirectClient:
             last_new = None
             first_logged = False
             approvals: set = set()
+            want_media = bool(NEEDS_BROWSER.search(text))   # 要图/视频/文件：附件可能比文字晚很多才出现
+            got_media = False
+            logged: set = set()
             last_appr = 0.0
             while True:
                 now = time.time()
@@ -309,15 +313,21 @@ class DirectClient:
                     if ev.get("event_name") == "delta.presentation" and (seq or 0) > baseline \
                             and seq not in delivered:
                         media = _presentation_media(_payload(ev))
+                        if not media and seq not in logged:
+                            logged.add(seq)
+                            log.info("直连：生成内容里没找到附件：%s", str({k: v for k, v in _payload(ev).items()
+                                     if k in ("kind", "data", "state")})[:600])
                         if not media:
-                            if str(_payload(ev).get("state") or "").lower() not in ("failed", "error", "cancelled"):
-                                pending = True
+                            if _payload(ev).get("kind") in ("image", "video", "file") and \
+                                    time.time() - t0 < MEDIA_WAIT * 2:
+                                pending = True      # 附件还没生成好
                             continue
                         delivered.add(seq)
                         log.info("直连：生成内容 %s", str({k: v for k, v in _payload(ev).items()
-                                                        if k in ("kind", "state", "image_path", "id")})[:300])
+                                                        if k in ("kind", "image_path", "id", "data")})[:600])
                         for m in media:
                             self._emit_media(m, out, on_message)
+                        got_media = True
                         last_new = time.time()
                         continue
                     if ev.get("event_name") != "message.assistant" or (seq or 0) <= baseline:
@@ -343,7 +353,10 @@ class DirectClient:
                     elif not (ev.get("reply_to_message_id") or _payload(ev).get("reply_to_message_id")) \
                             and _text(ev) and not _payload(ev).get("status"):
                         pending = True       # 还在写的回复，继续等
-                if out and not pending and last_new and time.time() - last_new > QUIET:
+                quiet = MEDIA_WAIT if (want_media and not got_media) else QUIET
+                if out and not pending and last_new and time.time() - last_new > quiet:
+                    if quiet == MEDIA_WAIT:
+                        log.info("直连：等了 %ds 没有等到附件", MEDIA_WAIT)
                     break
             return out
 
