@@ -1187,10 +1187,11 @@ class MuseEngine:
         return lines[0]||'file';
       }
       var allAtt=[].slice.call(scope.querySelectorAll(ATT));
-      var units=scope.querySelectorAll('div[class*="hatch-agent-bubble-bg"],'+ATT);
+      var units=scope.querySelectorAll('div[class*="chat-user-bubble"],div[class*="hatch-agent-bubble-bg"],'+ATT);
       var items=[];
       for(var i=0;i<units.length;i++){
         var u=units[i];
+        if(u.matches('[class*="chat-user-bubble"]')){ items.push({k:'u'}); continue; }
         if(inUser(u)) continue;
         if(u.matches(ATT)){
           var mm=u.querySelector('img,video');
@@ -1292,9 +1293,15 @@ class MuseEngine:
         return Counter(self._turn_sig(i) for i in self._poll_turn())
 
     def _new_turn_items(self, base) -> list[dict]:
+        """本轮新增的回复 = 页面里最后一条用户消息（刚发的那条）之后的所有内容。
+        这样不受聊天历史分批加载、下标变化的影响；看不到用户气泡时才退回按基线内容比对。"""
+        cur = self._poll_turn()
+        last_u = max((i for i, it in enumerate(cur) if it.get("k") == "u"), default=-1)
+        if last_u >= 0:
+            return [it for it in cur[last_u + 1:] if it.get("k") != "u"]
         left = base.copy()
         out = []
-        for it in self._poll_turn():
+        for it in cur:
             sig = self._turn_sig(it)
             if left[sig] > 0:
                 left[sig] -= 1

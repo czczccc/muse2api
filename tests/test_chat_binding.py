@@ -47,8 +47,18 @@ def test_new_turn_items_ignores_history():
     assert got == ["新回复", "blob:new"], got
 
 
+def test_new_turn_items_after_last_user_bubble():
+    e = object.__new__(engine_mod.MuseEngine)
+    e._poll_turn = lambda: [
+        {"k": "u"}, {"k": "t", "v": "旧回复"}, {"k": "m", "kind": "image", "src": "blob:old"},
+        {"k": "u"}, {"k": "t", "v": "新回复"}, {"k": "m", "kind": "image", "src": "blob:new"}]
+    got = [i.get("v") or i.get("src") for i in e._new_turn_items(e._turn_baseline())]
+    assert got == ["新回复", "blob:new"], got
+
+
 if __name__ == "__main__":
     test_close_page_keeps_chat_binding()
     test_turn_media_is_forwarded()
     test_new_turn_items_ignores_history()
+    test_new_turn_items_after_last_user_bubble()
     print("PASS")
