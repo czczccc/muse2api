@@ -22,7 +22,7 @@ NEEDS_BROWSER = re.compile(r"图|画|照片|海报|视频|文件|导出|下载|i
 
 
 def enabled() -> bool:
-    return os.environ.get("MUSE2API_DIRECT", "0").strip() not in ("", "0", "false", "off")
+    return os.environ.get("MUSE2API_DIRECT", "1").strip() not in ("", "0", "false", "off")
 
 
 class DirectNotSent(RuntimeError):

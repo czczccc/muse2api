@@ -78,7 +78,7 @@ def test_connect_failure_is_not_sent():
         sys.modules["mgateway.client"].Gateway = FakeGW
 
 
-def test_wx_chat_direct_emits_early_and_falls_back_for_media():
+def test_wx_chat_direct_emits_early():
     FakeGW.script = [[ev(11, "第一段"), ev(12, "第二段")]]
     store.get_account = lambda aid: {"id": aid, "cookies": {"hatch_sess": "x"}, "enabled": True}
     sent = []

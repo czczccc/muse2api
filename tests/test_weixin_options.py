@@ -6,6 +6,7 @@ from pathlib import Path
 
 os.environ["MUSE2API_HOME"] = tempfile.mkdtemp()
 os.environ["MUSE2API_KEY"] = "k"
+os.environ.setdefault("MUSE2API_DIRECT", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import runner  # noqa: E402,F401
 import state  # noqa: E402

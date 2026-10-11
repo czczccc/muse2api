@@ -159,11 +159,9 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
         acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
         if not acc:
             raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
-    if direct.enabled() and not direct.NEEDS_BROWSER.search(text):
-        try:
-            return _wx_chat_direct(user, text, emit, acc, hist)
-        except direct.DirectNotSent as exc:     # 消息没发出去：退回浏览器方案
-            log.warning("直连不可用，退回浏览器：%s", str(exc)[:160])
+    if direct.enabled():
+        # 浏览器对话方案已停用：只走直连，失败直接报错
+        return _wx_chat_direct(user, text, emit, acc, hist)
     opts: list[str] = []
     turn: list[dict] = []
     early: list[dict] = []      # 生成过程中已经先发出去的气泡/附件
@@ -317,8 +315,9 @@ def warm_wx(acc_id: str):
                 direct.get_client(acc_id).warm(acc["cookies"])
             except Exception as exc:  # noqa: BLE001
                 log.warning("直连网关预热失败（发消息时会重试）: %s", str(exc)[:160])
-        engine.start()
-        engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc_id)
+        if not direct.enabled():
+            engine.start()
+            engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("微信对话页面预热失败（不影响使用）: %s", exc)
 
