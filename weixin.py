@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -429,30 +430,53 @@ class WeixinBot:
         threading.Thread(target=run, daemon=True, name="wx-typing").start()
         return stop
 
+    def _send_reply(self, client, user: str, ctx: str, r):
+        if r[0] == "text":
+            client.send_text(user, r[1], ctx)
+        else:
+            with open(r[1], "rb") as f:
+                client.send_media(user, f.read(), r[2], ctx, name=os.path.basename(r[1]))
+            log.info("微信已发送%s：%s", r[2], os.path.basename(r[1]))
+
     def _handle(self, user: str, text: str, ctx: str):
         client = self._client()
         typing = self._typing_start(client, user, ctx)
+        sent = [0]      # 生成过程中已经先发出去的条数，计入每条入站消息最多回 10 条的预算
+
+        def emit(replies):
+            """处理过程中先发出已完成的部分；预算不够（要给最后的内容留位置）时返回 False。"""
+            n = sum(len(split_text(r[1])) if r[0] == "text" else 1 for r in replies)
+            if sent[0] + n > MAX_REPLIES - 2:
+                return False
+            for r in replies:
+                if sent[0]:
+                    time.sleep(CHUNK_GAP)
+                try:
+                    self._send_reply(client, user, ctx, r)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("微信发送失败: %s", exc)
+                    self.last_error = str(exc)[:200]
+                sent[0] += len(split_text(r[1])) if r[0] == "text" else 1
+            return True
+
         try:
-            replies = self.handler(user, text)
+            if "emit" in inspect.signature(self.handler).parameters:
+                replies = self.handler(user, text, emit=emit)
+            else:
+                replies = self.handler(user, text)
         except Exception as exc:  # noqa: BLE001
             log.exception("微信消息处理失败")
             replies = [("text", f"处理失败：{str(exc)[:200]}")]
         finally:
             if typing is not None:
                 typing.set()
-        replies = compact_replies(replies)
+        replies = compact_replies(replies, limit=max(1, MAX_REPLIES - sent[0]))
         log.info("微信回复 %s：%s", user[-6:], [(r[0], r[2] if r[0] == "media" else len(r[1])) for r in replies])
         for i, r in enumerate(replies):
-            if i:
+            if i or sent[0]:
                 time.sleep(CHUNK_GAP)
             try:
-                if r[0] == "text":
-                    client.send_text(user, r[1], ctx)
-                else:
-                    with open(r[1], "rb") as f:
-                        client.send_media(user, f.read(), r[2], ctx,
-                                          name=os.path.basename(r[1]))
-                    log.info("微信已发送%s：%s", r[2], os.path.basename(r[1]))
+                self._send_reply(client, user, ctx, r)
             except Exception as exc:  # noqa: BLE001
                 log.warning("微信发送失败: %s", exc)
                 self.last_error = str(exc)[:200]

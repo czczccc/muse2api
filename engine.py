@@ -41,27 +41,57 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
-WARM_IDLE_SECONDS = 240   # 常驻页面空闲多久后关闭（太久不用连接可能已失效）
+WARM_IDLE_SECONDS = int(os.environ.get("MUSE2API_WARM_IDLE", "1800"))   # 常驻页面空闲多久后关闭
 
 
 class _ChatRunner:
     """某账号的常驻对话线程：页面是按线程隔离的，对话固定在同一个线程里跑，
-    页面就能在两条消息之间保持打开，省掉每次开页、注入 cookie、加载会话的几秒到几十秒。"""
+    页面就能在两条消息之间保持打开，省掉每次开页、注入 cookie、加载会话的几秒到几十秒。
+    空闲期间定期检查页面是否健康，坏了就重开（预热），超过 idle 秒没人用才关闭。"""
 
     def __init__(self, engine, idle: float = WARM_IDLE_SECONDS):
         self.engine = engine
         self.idle = idle
+        self.tick = min(60.0, idle)
+        self.last_used = time.time()
+        self.warm_args = None          # (cookies, expires, account_id)：重开页面用
         self.jobs: queue.Queue = queue.Queue()
         self.thread = threading.Thread(target=self._loop, daemon=True, name="muse-chat-runner")
         self.thread.start()
 
+    def _warm(self):
+        if not self.warm_args:
+            return
+        try:
+            self.engine.warm_chat_page(*self.warm_args)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("预热对话页面失败（不影响使用，下条消息会重新打开）: %s", exc)
+            self.engine._close_page()
+
+    def _maintain(self):
+        if time.time() - self.last_used > self.idle:
+            self.engine._close_page()      # 空闲太久，释放页面；下次请求再开
+            return
+        check = getattr(self.engine, "_page_healthy", None)
+        if check is not None and self.engine.page is not None and not check():
+            log.info("常驻对话页面已失效，重新预热")
+            self.engine._close_page()
+            self._warm()
+
     def _loop(self):
         while True:
             try:
-                out, args, kwargs = self.jobs.get(timeout=self.idle)
+                job = self.jobs.get(timeout=self.tick)
             except queue.Empty:
-                self.engine._close_page()      # 空闲太久，释放页面；下次请求再开
+                self._maintain()
                 continue
+            if job[0] == "warm":
+                self.warm_args = job[1]
+                self.last_used = time.time()
+                self._warm()
+                continue
+            _, out, args, kwargs = job
+            self.warm_args = (args[0], args[2], kwargs.get("account_id"))
             try:
                 for chunk in self.engine.chat_stream(*args, **kwargs):
                     out.put(("data", chunk))
@@ -69,11 +99,15 @@ class _ChatRunner:
                 out.put(("error", exc))
                 self.engine._close_page()      # 出错后别留着可能已坏的页面
             finally:
+                self.last_used = time.time()
                 out.put(("done", None))
+
+    def warm(self, cookies, expires, account_id):
+        self.jobs.put(("warm", (cookies, expires, account_id)))
 
     def run(self, *args, **kwargs):
         out: queue.Queue = queue.Queue()
-        self.jobs.put((out, args, kwargs))
+        self.jobs.put(("chat", out, args, kwargs))
         while True:
             kind, val = out.get()
             if kind == "data":
@@ -1363,7 +1397,28 @@ class MuseEngine:
                 out.append(it)
         return out
 
-    def _report_turn(self, on_turn, base, wait_media: float = 0.0):
+    def _materialize(self, items: list[dict]):
+        """把文件/图片/视频项的字节取回来（失败则 data=None）。"""
+        for it in items:
+            if it.get("k") == "f":
+                it["data"] = self._fetch_attachment(it["idx"], it["name"])
+            elif it.get("k") == "m":
+                try:
+                    it["data"], it["mime"], _ = self.extract_bytes(it["src"], it.get("kind", "image"), retries=2)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("取回聊天里的%s失败: %s", it.get("kind"), exc)
+                    it["data"] = None
+
+    def _emit_partial(self, on_partial, base, n_emitted: list):
+        """生成过程中把已经完成的气泡/附件先交出去（最后一项可能还在生成，留到结束时）。"""
+        ready = self._new_turn_items(base)[:-1]
+        if len(ready) > n_emitted[0]:
+            new = ready[n_emitted[0]:]
+            self._materialize(new)
+            if on_partial(new) is not False:
+                n_emitted[0] = len(ready)
+
+    def _report_turn(self, on_turn, base, wait_media: float = 0.0, skip: int = 0):
         """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。
         wait_media>0（用户在要图/视频/文件）时，文字说完后附件可能还在生成，最多再等这么多秒。"""
         if on_turn is None:
@@ -1387,15 +1442,8 @@ class MuseEngine:
             log.info("页面附件现状: %s", self.page.js(self._ATT_DEBUG_JS))
         except Exception:  # noqa: BLE001
             pass
-        for it in items:
-            if it.get("k") == "f":
-                it["data"] = self._fetch_attachment(it["idx"], it["name"])
-            elif it.get("k") == "m":
-                try:
-                    it["data"], it["mime"], _ = self.extract_bytes(it["src"], it.get("kind", "image"), retries=2)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("取回聊天里的%s失败: %s", it.get("kind"), exc)
-                    it["data"] = None
+        items = items[skip:]          # 前 skip 项已经在生成过程中先发出去了
+        self._materialize(items)
         log.info("本轮回复解析：文本 %d 段、文件 %d 个、图片/视频 %d 个",
                  sum(1 for i in items if i.get("k") == "t"),
                  sum(1 for i in items if i.get("k") == "f"),
@@ -1425,7 +1473,7 @@ class MuseEngine:
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, main_chat: bool = False,
                     fallback_prompt: str | None = None, on_options=None,
-                    on_prompt=None, on_turn=None):
+                    on_prompt=None, on_turn=None, on_partial=None):
         """发一条消息，流式 yield 增量文本。
 
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
@@ -1472,6 +1520,7 @@ class MuseEngine:
         got_first = False
         last_dlg = [0.0]
         last_cnt = -1
+        n_emitted, last_part = [0], [0.0]
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
@@ -1516,6 +1565,12 @@ class MuseEngine:
             if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
                 last_dlg[0] = time.time()
                 deadline += self.handle_dialog(on_prompt)
+            if on_partial is not None and on_turn is not None and time.time() - last_part[0] > 1.0:
+                last_part[0] = time.time()
+                try:
+                    self._emit_partial(on_partial, base_turn, n_emitted)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("分段先发失败（忽略，结束时一并发送）: %s", exc)
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue
@@ -1533,26 +1588,64 @@ class MuseEngine:
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn, wait_media=want_media)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media, skip=n_emitted[0])
                     log.info("对话耗时：从发送到结束共 %.1fs", time.time() - t_ready)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= (600 if on_turn is not None else 80):
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn, wait_media=want_media)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media, skip=n_emitted[0])
                     return
 
         raise MuseGenerationError("等待助手回复超时")
 
-    def chat_stream_warm(self, cookies: dict, prompt: str, expires: dict | None = None,
-                         timeout: int | None = None, account_id: str | None = None, **kwargs):
-        """同 chat_stream，但在该账号的常驻线程里执行，页面在请求之间保持打开。"""
+    def _runner(self, account_id: str | None) -> "_ChatRunner":
         key = account_id or "_"
         with self._runners_lock:
             runner = self._runners.get(key)
             if runner is None:
                 runner = self._runners[key] = _ChatRunner(self)
-        return runner.run(cookies, prompt, expires, timeout, account_id=account_id, **kwargs)
+        return runner
+
+    def chat_stream_warm(self, cookies: dict, prompt: str, expires: dict | None = None,
+                         timeout: int | None = None, account_id: str | None = None, **kwargs):
+        """同 chat_stream，但在该账号的常驻线程里执行，页面在请求之间保持打开。"""
+        return self._runner(account_id).run(cookies, prompt, expires, timeout,
+                                            account_id=account_id, **kwargs)
+
+    def prewarm_chat(self, cookies: dict, expires: dict | None, account_id: str | None):
+        """提前在该账号的常驻线程里打开对话页面（不阻塞），让第一条消息也是快的。"""
+        self._runner(account_id).warm(cookies, expires, account_id)
+
+    def warm_chat_page(self, cookies: dict, expires: dict | None, account_id: str | None):
+        """（在常驻线程里执行）把页面开到已绑定的会话，没有绑定就尝试进「主要聊天」并绑定。"""
+        key = account_id or "_"
+        self.start()
+        bound = self._chat_urls.get(key)
+        try:
+            self.ensure_page(cookies, expires, account_id=account_id, start_url=bound)
+        except MuseGenerationError:
+            if not bound:
+                raise
+            self._chat_urls.pop(key, None)
+            bound = None
+            self.ensure_page(cookies, expires, account_id=account_id)
+        self._close_dialog()
+        if not bound and self.open_main_chat():
+            u = self._page_url()
+            if u:
+                self._chat_urls[key] = u
+        self._wait_chat_loaded()
+        log.info("对话页面已预热：%s", self._page_url())
+
+    def _page_healthy(self) -> bool:
+        try:
+            return bool(self.page.js(
+                "(function(){var t=document.body?document.body.innerText:'';"
+                "return !!document.querySelector('textarea')&&t.indexOf('Still sending')===-1"
+                "&&t.indexOf('Connecting...')===-1;})()"))
+        except Exception:  # noqa: BLE001
+            return False
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:

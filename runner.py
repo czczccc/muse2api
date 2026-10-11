@@ -43,7 +43,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      main_chat: bool = False, fallback_prompt: str | None = None,
-                     on_options=None, on_prompt=None, on_turn=None):
+                     on_options=None, on_prompt=None, on_turn=None, on_partial=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -99,7 +99,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             account_id=cur_id, stop_event=stop_event,
                             main_chat=main_chat, fallback_prompt=fallback_prompt,
                             on_options=on_options, on_prompt=on_prompt,
-                            on_turn=on_turn
+                            on_turn=on_turn, on_partial=on_partial
                         ):
                             yielded = True
                             q.put(("data", chunk))

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -92,6 +93,8 @@ async def _startup():
     asyncio.create_task(_keepalive_loop())
     if CFG.weixin_enabled:
         wx_bridge.weixin.start()
+        if wx_bridge.weixin.state.get("bot_token"):
+            threading.Thread(target=wx_bridge.warm_wx, daemon=True, name="wx-warm").start()
 
 
 @app.on_event("shutdown")

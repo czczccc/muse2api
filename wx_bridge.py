@@ -13,7 +13,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from prompts import build_chat_prompt, build_image_prompt, build_video_prompt
 from runner import _run_generation, safe_chat_stream
 from schemas import ChatMessage, ImageRequest, VideoRequest
-from state import CFG, auth, engine, store
+from state import CFG, auth, engine, log, store
 from weixin import WeixinBot
 
 router = APIRouter()
@@ -23,6 +23,7 @@ WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 
            "/重置：开始新话题（若接入的是 muse 主要聊天，其中的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
 _wx_accounts: dict[str, str] = {}   # 微信用户 -> 固定使用的账号
+_wx_default_acc: str | None = None   # 预热用的账号；新用户优先分到它
 
 
 _wx_options: dict[str, list[str]] = {}
@@ -132,7 +133,7 @@ def wx_turn_replies(turn: list[dict], opts: list[str]) -> list:
     return replies
 
 
-def _wx_chat(user: str, text: str) -> list:
+def _wx_chat(user: str, text: str, emit=None) -> list:
     """微信对话走 muse.ai 的聊天：只发新消息，上下文由 muse 自己记。
     一轮回复的多个气泡、文件、代码块都按顺序转发；取不到分段信息时退回合并文本。"""
     text = wx_resolve_option(text, _wx_options.pop(user, []))
@@ -143,42 +144,55 @@ def _wx_chat(user: str, text: str) -> list:
     # 同一微信用户固定用同一个账号：对话会话是按账号记住的，轮换账号就会每条消息新开一个旁聊
     acc = store.get_account(_wx_accounts.get(user) or "")
     if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
-        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+        acc = store.pick_account(rotate=True, preferred_id=_wx_default_acc or getattr(engine, "current_acc_id", None))
         if acc:
             _wx_accounts[user] = acc["id"]
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
     opts: list[str] = []
     turn: list[dict] = []
+    early: list[dict] = []      # 生成过程中已经先发出去的气泡/附件
+
+    def on_partial(items):
+        rs = wx_turn_replies(items, [])
+        if rs and emit(rs) is False:
+            return False        # 条数预算不够了，留到结束时合并发送
+        early.extend(items)
+        return True
+
+    kwargs = {"on_partial": on_partial} if emit is not None else {}
     out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
                                    CFG.chat_timeout, account_id=acc["id"],
                                    main_chat=True, fallback_prompt=fallback,
                                    on_options=opts.extend, on_turn=turn.extend,
-                                   on_prompt=lambda t, b: wx_ask_permission(user, t, b))).strip()
+                                   on_prompt=lambda t, b: wx_ask_permission(user, t, b),
+                                   **kwargs)).strip()
     if opts:
         _wx_options[user] = list(opts)
     replies = wx_turn_replies(turn, opts) if turn else []
-    texts = [it["v"] for it in turn if it.get("k") == "t"] or ([out] if out else [])
+    texts = [it["v"] for it in early + turn if it.get("k") == "t"] or ([out] if out else [])
     if texts:
         hist.append(ChatMessage(role="assistant", content="\n\n".join(texts)))
         del hist[:-12]
     if replies:
         return replies
+    if early:        # 内容都已经先发过了，结束时没有新增内容；只补上选项
+        return [("text", wx_format_options("", opts))] if opts else []
     if out:
         return [("text", wx_format_options(out, opts) if opts else out)]
     return [("text", "（没有收到回复，请稍后重试）")]
 
 
-def _wx_handle(user: str, text: str) -> list:
+def _wx_handle(user: str, text: str, emit=None) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
     answered = wx_answer_prompt(user, text)
     if answered is not None:       # 回答授权弹窗不能被同一用户正在跑的任务挡住
         return [("text", answered)]
     with _wx_locks.setdefault(user, threading.Lock()):   # 同一用户的消息按顺序处理
-        return _wx_handle_locked(user, text)
+        return _wx_handle_locked(user, text, emit)
 
 
-def _wx_handle_locked(user: str, text: str) -> list:
+def _wx_handle_locked(user: str, text: str, emit=None) -> list:
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
@@ -201,10 +215,24 @@ def _wx_handle_locked(user: str, text: str) -> list:
         return [("text", "已清空对话上下文。")]
     if text.strip() in ("/帮助", "/help", "/?"):
         return [("text", WX_HELP)]
-    return _wx_chat(user, text)
+    return _wx_chat(user, text, emit)
 
 
 weixin = WeixinBot(CFG.weixin_file, _wx_handle, allow_env=CFG.weixin_allow_from)
+
+
+def warm_wx():
+    """服务启动后提前把微信对话用的页面打开，让第一条消息也是快的。"""
+    global _wx_default_acc
+    try:
+        acc = store.pick_account(rotate=False)
+        if not acc:
+            return
+        _wx_default_acc = acc["id"]
+        engine.start()
+        engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc["id"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("微信对话页面预热失败（不影响使用）: %s", exc)
 
 
 def _qr_svg(content: str) -> str:

@@ -188,3 +188,23 @@ def test_typing_and_ctx_persist():
     assert seen and seen[0] == ("TICKET", True) and seen[-1] == ("TICKET", False), seen
     bot2 = W.WeixinBot(os.path.join(d, "wx.json"), lambda u, t: [], client_factory=TC)
     assert bot2._ctx.get("u1") == "ctx2", "context_token 应该存盘，重启后还在"
+
+
+def test_emit_sends_early_and_respects_budget():
+    d = tempfile.mkdtemp()
+    FakeClient.sent = []
+    flags = []
+
+    def handler(user, text, emit=None):
+        flags.append(emit([("text", "第一段")]))
+        for i in range(12):                      # 预算用完后 emit 应该拒绝
+            flags.append(emit([("text", f"p{i}")]))
+        return [("text", "最后")]
+
+    bot = W.WeixinBot(os.path.join(d, "wx.json"), handler, client_factory=FakeClient)
+    bot.state["bot_token"] = "x"
+    bot._handle("u1", "hi", "ctx")
+    texts = [s[2] for s in FakeClient.sent if s[0] == "text"]
+    assert texts[0] == "第一段" and texts[-1] == "最后", texts
+    assert flags[0] is True and flags[-1] is False, flags
+    assert len(texts) <= W.MAX_REPLIES, texts

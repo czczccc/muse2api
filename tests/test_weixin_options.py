@@ -126,7 +126,7 @@ def test_same_user_messages_are_serialized():
     import time
     order = []
 
-    def slow(user, text):
+    def slow(user, text, emit=None):
         order.append(("start", text))
         time.sleep(0.2)
         order.append(("end", text))
