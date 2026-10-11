@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -32,7 +33,10 @@ CHANNEL_VERSION = "2.4.6"
 ERR_SESSION_EXPIRED = -14
 MEDIA_TYPE = {"image": 1, "video": 2, "file": 3}
 ITEM_TYPE = {"text": 1, "image": 2, "video": 5, "file": 4}
-MAX_TEXT = 1800  # 单条文本保守上限，超长自动分段
+MAX_TEXT = 4000  # 单条文本上限（参考 Hermes 的实测值），超长按段落自动分段
+CHUNK_GAP = 0.3  # 连续发送多条之间的间隔，避免被限流丢消息
+TYPING_REFRESH = 4.0
+TYPING_TICKET_TTL = 600
 
 
 # ---------------------------- AES-128-ECB (PKCS7) ----------------------------
@@ -43,6 +47,38 @@ def aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
     padded = padder.update(data) + padder.finalize()
     enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
     return enc.update(padded) + enc.finalize()
+
+
+def aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    padded = dec.update(data) + dec.finalize()
+    try:
+        unp = padding.PKCS7(128).unpadder()
+        return unp.update(padded) + unp.finalize()
+    except ValueError:
+        return padded
+
+
+def _parse_aes_key(item: dict) -> bytes | None:
+    """入站媒体的 AES key：image_item.aeskey 是 hex；media.aes_key 是 base64（内容为 16 字节原始 key 或 32 位 hex）。"""
+    hx = item.get("aeskey")
+    if isinstance(hx, str) and len(hx) == 32:
+        try:
+            return bytes.fromhex(hx)
+        except ValueError:
+            pass
+    b64 = (item.get("media") or {}).get("aes_key")
+    if b64:
+        raw = base64.b64decode(b64)
+        if len(raw) == 16:
+            return raw
+        try:
+            return bytes.fromhex(raw.decode())
+        except ValueError:
+            return None
+    return None
 
 
 def padded_size(n: int) -> int:
@@ -69,6 +105,32 @@ def split_text(text: str, limit: int = MAX_TEXT) -> list[str]:
     if cur:
         out.append(cur)
     return [x for x in out if x.strip()]
+
+
+MAX_REPLIES = 10   # 实测：一条入站消息（一个 context_token）最多回 10 条，超出 sendmessage 返回 ret=-2 prepare failed
+
+
+def compact_replies(replies: list, limit: int = MAX_REPLIES) -> list:
+    """把相邻文本合并，并保证实际发出的消息数不超过 limit（文本会按长度再分段，也要计入）。"""
+    merged: list = []
+    for r in replies:
+        if r[0] == "text" and merged and merged[-1][0] == "text":
+            merged[-1] = ("text", merged[-1][1] + "\n\n" + r[1])
+        else:
+            merged.append(r)
+    out, used = [], 0
+    for i, r in enumerate(merged):
+        n = len(split_text(r[1])) if r[0] == "text" else 1
+        if used + n > limit - (0 if i == len(merged) - 1 else 1) and out:
+            out.append(("text", "（回复内容较多，后面的部分已省略，请到 muse.ai 页面查看）"))
+            return out
+        if used + n > limit:        # 单条文本就超限：截断分段
+            parts = split_text(r[1])[:max(1, limit - used - 1)]
+            out.append(("text", "\n".join(parts) + "\n…（已截断，请到 muse.ai 页面查看）"))
+            return out
+        out.append(r)
+        used += n
+    return out
 
 
 # ---------------------------- iLink HTTP 客户端 ----------------------------
@@ -117,13 +179,41 @@ class ILinkClient:
                "message_state": 2, "context_token": context_token, "item_list": [item]}
         res = self._post("/ilink/bot/sendmessage", {"msg": msg})
         code = res.get("ret", res.get("errcode", 0)) or 0
+        if code == -2 and context_token:
+            # prepare failed：context_token 过期或已用完，不带 token 再试一次（Hermes 同样这样处理）
+            log.warning("sendmessage prepare failed，改为不带 context_token 重试一次")
+            msg["context_token"] = ""
+            res = self._post("/ilink/bot/sendmessage", {"msg": msg})
+            code = res.get("ret", res.get("errcode", 0)) or 0
         if code:
             raise RuntimeError(f"sendmessage 失败 ret={code} {res.get('errmsg', '')}")
         return res
 
     def send_text(self, to_user: str, text: str, context_token: str):
-        for part in split_text(text):
+        for i, part in enumerate(split_text(text)):
+            if i:
+                time.sleep(CHUNK_GAP)
             self._send(to_user, {"type": ITEM_TYPE["text"], "text_item": {"text": part}}, context_token)
+
+    # 「对方正在输入」提示：getconfig 取 typing_ticket，sendtyping 的 status 1=开始、2=取消
+    def get_typing_ticket(self, to_user: str, context_token: str) -> str:
+        res = self._post("/ilink/bot/getconfig", {"ilink_user_id": to_user, "context_token": context_token})
+        return res.get("typing_ticket") or ""
+
+    def send_typing(self, to_user: str, ticket: str, typing: bool = True):
+        self._post("/ilink/bot/sendtyping", {"ilink_user_id": to_user, "typing_ticket": ticket,
+                                             "status": 1 if typing else 2})
+
+    def download_media(self, item: dict) -> bytes | None:
+        """下载并解密入站图片/文件（image_item / file_item）。"""
+        media = item.get("media") or {}
+        param = media.get("encrypt_query_param")
+        key = _parse_aes_key(item)
+        if not param or not key:
+            return None
+        r = self.http.get(f"{self.cdn}/download?encrypted_query_param={quote(param)}", timeout=60)
+        r.raise_for_status()
+        return aes_ecb_decrypt(r.content, key)
 
     def upload_media(self, data: bytes, kind: str, to_user: str) -> dict:
         aeskey = secrets.token_bytes(16)
@@ -140,9 +230,16 @@ class ILinkClient:
                 raise RuntimeError("getuploadurl 未返回上传地址")
             full = f"{self.cdn}/upload?encrypted_query_param={quote(param)}&filekey={quote(filekey)}"
         last = None
-        for _ in range(3):
-            r = self.http.post(full, data=cipher, timeout=120,
-                               headers={"Content-Type": "application/octet-stream"})
+        for attempt in range(3):
+            try:
+                r = self.http.post(full, data=cipher, timeout=120,
+                                   headers={"Content-Type": "application/octet-stream",
+                                            "Connection": "close"})
+            except requests.RequestException as exc:   # TLS 被对端中断等：换新连接重试
+                last = f"{type(exc).__name__}: {str(exc)[:120]}"
+                log.warning("CDN 上传第 %d 次网络错误（%d 字节）: %s", attempt + 1, len(cipher), last)
+                time.sleep(1.5 * (attempt + 1))
+                continue
             if 400 <= r.status_code < 500:
                 raise RuntimeError(f"CDN 上传被拒绝: {r.headers.get('x-error-message') or r.text[:100]}")
             dl = r.headers.get("x-encrypted-param")
@@ -189,7 +286,9 @@ class WeixinBot:
         self._thread: threading.Thread | None = None
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wx")
         self._seen: list = []
-        self._ctx: dict[str, str] = {}   # 每个用户最近一条入站消息的 context_token
+        # 每个用户最近一条入站消息的 context_token；存盘，重启后也能回复
+        self._ctx: dict[str, str] = dict(self.state.get("ctx") or {})
+        self._typing: dict[str, tuple[str, float]] = {}   # 用户 -> (typing_ticket, 取得时间)
         if self.state.get("bot_token"):
             self.status = "connected"
 
@@ -339,29 +438,103 @@ class WeixinBot:
         ctx = m.get("context_token", "")
         text = "".join((it.get("text_item") or {}).get("text", "")
                        for it in m.get("item_list") or [] if it.get("type") == 1).strip()
-        if not user or not text:
+        imgs = [it.get("image_item") or {} for it in m.get("item_list") or [] if it.get("type") == 2]
+        if not user or not (text or imgs):
             return
         if not self.allowed(user):
             log.info("微信消息被白名单拦截: %s", user)
             return
         self._ctx[user] = ctx
-        self.pool.submit(self._handle, user, text, ctx)
+        if ctx and self.state.setdefault("ctx", {}).get(user) != ctx:
+            self.state["ctx"][user] = ctx
+            self._save()
+        self.pool.submit(self._handle, user, text, ctx, imgs)
 
-    def _handle(self, user: str, text: str, ctx: str):
+    def _typing_start(self, client, user: str, ctx: str):
+        """处理期间持续给对方显示「正在输入」，返回停止用的 Event；失败一律忽略，不影响回复。"""
+        if not hasattr(client, "send_typing"):
+            return None
+        stop = threading.Event()
+
+        def run():
+            try:
+                ticket, ts = self._typing.get(user, ("", 0.0))
+                if not ticket or time.time() - ts > TYPING_TICKET_TTL:
+                    ticket = client.get_typing_ticket(user, ctx)
+                    self._typing[user] = (ticket, time.time())
+                if not ticket:
+                    return
+                while not stop.is_set():
+                    client.send_typing(user, ticket, True)
+                    stop.wait(TYPING_REFRESH)
+                client.send_typing(user, ticket, False)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("正在输入提示失败（忽略）: %s", exc)
+
+        threading.Thread(target=run, daemon=True, name="wx-typing").start()
+        return stop
+
+    def _send_reply(self, client, user: str, ctx: str, r):
+        if r[0] == "text":
+            client.send_text(user, r[1], ctx)
+        else:
+            with open(r[1], "rb") as f:
+                client.send_media(user, f.read(), r[2], ctx, name=os.path.basename(r[1]))
+            log.info("微信已发送%s：%s", r[2], os.path.basename(r[1]))
+
+    def _handle(self, user: str, text: str, ctx: str, imgs: list | None = None):
         client = self._client()
+        images = []
+        for it in imgs or []:
+            try:
+                data = client.download_media(it)
+                if data:
+                    images.append(data)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("下载微信图片失败: %s", exc)
+        if imgs and not images and not text:
+            self._send_reply(client, user, ctx, ("text", "图片没能下载下来，请重发一次。"))
+            return
+        typing = self._typing_start(client, user, ctx)
+        sent = [0]      # 生成过程中已经先发出去的条数，计入每条入站消息最多回 10 条的预算
+
+        def emit(replies):
+            """处理过程中先发出已完成的部分；预算不够（要给最后的内容留位置）时返回 False。"""
+            n = sum(len(split_text(r[1])) if r[0] == "text" else 1 for r in replies)
+            if sent[0] + n > MAX_REPLIES - 2:
+                return False
+            for r in replies:
+                if sent[0]:
+                    time.sleep(CHUNK_GAP)
+                try:
+                    self._send_reply(client, user, ctx, r)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("微信发送失败: %s", exc)
+                    self.last_error = str(exc)[:200]
+                sent[0] += len(split_text(r[1])) if r[0] == "text" else 1
+            return True
+
         try:
-            replies = self.handler(user, text)
+            params = inspect.signature(self.handler).parameters
+            if "images" in params:
+                replies = self.handler(user, text, emit=emit, images=images)
+            elif "emit" in params:
+                replies = self.handler(user, text, emit=emit)
+            else:
+                replies = self.handler(user, text)
         except Exception as exc:  # noqa: BLE001
             log.exception("微信消息处理失败")
             replies = [("text", f"处理失败：{str(exc)[:200]}")]
-        for r in replies:
+        finally:
+            if typing is not None:
+                typing.set()
+        replies = compact_replies(replies, limit=max(1, MAX_REPLIES - sent[0]))
+        log.info("微信回复 %s：%s", user[-6:], [(r[0], r[2] if r[0] == "media" else len(r[1])) for r in replies])
+        for i, r in enumerate(replies):
+            if i or sent[0]:
+                time.sleep(CHUNK_GAP)
             try:
-                if r[0] == "text":
-                    client.send_text(user, r[1], ctx)
-                else:
-                    with open(r[1], "rb") as f:
-                        client.send_media(user, f.read(), r[2], ctx,
-                                          name=os.path.basename(r[1]))
+                self._send_reply(client, user, ctx, r)
             except Exception as exc:  # noqa: BLE001
                 log.warning("微信发送失败: %s", exc)
                 self.last_error = str(exc)[:200]

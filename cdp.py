@@ -20,6 +20,7 @@ class CDP:
         self.timeout = timeout
         self._id = 0
         self._lock = threading.Lock()
+        self.on_event = None   # 可选：send() 等待响应期间收到的事件也交给它（抓包用）
 
     def send(self, method: str, params: dict | None = None, timeout: float | None = None):
         with self._lock:
@@ -34,6 +35,11 @@ class CDP:
                     continue
                 except Exception:  # noqa: BLE001
                     continue
+                if self.on_event and "method" in msg:
+                    try:
+                        self.on_event(msg)
+                    except Exception:  # noqa: BLE001
+                        pass
                 if msg.get("id") == mid:
                     if "error" in msg:
                         raise CDPError(f"{method}: {msg['error']}")

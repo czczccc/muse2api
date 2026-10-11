@@ -6,6 +6,7 @@ from pathlib import Path
 
 os.environ["MUSE2API_HOME"] = tempfile.mkdtemp()
 os.environ["MUSE2API_KEY"] = "k"
+os.environ.setdefault("MUSE2API_DIRECT", "0")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import runner  # noqa: E402,F401
 import state  # noqa: E402
@@ -126,7 +127,7 @@ def test_same_user_messages_are_serialized():
     import time
     order = []
 
-    def slow(user, text):
+    def slow(user, text, emit=None, **kw):
         order.append(("start", text))
         time.sleep(0.2)
         order.append(("end", text))
@@ -150,3 +151,25 @@ if __name__ == "__main__":
     test_enter_chat_binding()
     test_same_user_messages_are_serialized()
     print("weixin options tests OK")
+
+
+def test_each_bot_uses_its_own_account():
+    used = []
+
+    def fake_stream(cookies, prompt, exp, timeout, account_id=None, **kw):
+        used.append((account_id, cookies.get("who")))
+        yield "ok"
+
+    wx_bridge.safe_chat_stream = fake_stream
+    accs = {"a1": {"id": "a1", "cookies": {"who": "A"}, "enabled": True},
+            "a2": {"id": "a2", "cookies": {"who": "B"}, "enabled": True}}
+    state.store.get_account = lambda aid: accs.get(aid)
+    for aid, user in (("a1", "uA"), ("a2", "uB")):
+        wx_bridge._wx_chat(user, "hi", acc_id=aid)
+    assert used == [("a1", "A"), ("a2", "B")], used
+    accs["a2"]["enabled"] = False
+    try:
+        wx_bridge._wx_chat("uB", "hi", acc_id="a2")
+        assert False, "停用的账号应报错"
+    except RuntimeError as exc:
+        assert "不可用" in str(exc)

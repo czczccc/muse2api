@@ -7,7 +7,7 @@ import re
 import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseGenerationError
 from keepalive import KEEPALIVE_STATE, _probe_account_sync, run_keepalive_all
@@ -386,3 +386,17 @@ def get_keepalive_status(_=Depends(auth)):
     return KEEPALIVE_STATE
 
 
+
+
+# ------------------------- 前端页面 -------------------------
+_ADMIN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin.html")
+
+
+@router.get("/", response_class=HTMLResponse)
+@router.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    try:
+        with open(_ADMIN_HTML, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        raise HTTPException(404, "管理页面文件 admin.html 缺失")

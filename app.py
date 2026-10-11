@@ -91,10 +91,10 @@ async def _startup():
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
     if CFG.weixin_enabled:
-        wx_bridge.weixin.start()
+        wx_bridge.start_bots()
 
 
 @app.on_event("shutdown")
 def _shutdown():
-    wx_bridge.weixin.stop()
+    wx_bridge.stop_bots()
     engine.stop()

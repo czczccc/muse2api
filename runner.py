@@ -43,7 +43,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      main_chat: bool = False, fallback_prompt: str | None = None,
-                     on_options=None, on_prompt=None, on_turn=None):
+                     on_options=None, on_prompt=None, on_turn=None, on_partial=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -93,12 +93,13 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if stop_event.is_set():
                             return
                         engine.start()
-                        for chunk in engine.chat_stream(
+                        stream = engine.chat_stream_warm if main_chat else engine.chat_stream
+                        for chunk in stream(
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
                             main_chat=main_chat, fallback_prompt=fallback_prompt,
                             on_options=on_options, on_prompt=on_prompt,
-                            on_turn=on_turn
+                            on_turn=on_turn, on_partial=on_partial
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -128,7 +129,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         finally:
             if leased_id:
                 ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
+            if not main_chat:        # 主要聊天的页面由常驻线程持有，保持打开以便下一条消息秒回
+                engine.close_current_page()
             q.put(("done", None))
 
     threading.Thread(target=worker, daemon=True).start()

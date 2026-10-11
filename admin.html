@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>muse2api</title>
+<style>
+body{font:14px system-ui,sans-serif;max-width:860px;margin:0 auto;padding:12px;color:#222}
+h2{margin:18px 0 6px;font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px}
+input,textarea,button{font:inherit;padding:4px 8px;margin:2px 0}
+textarea,input[type=text],input[type=password]{width:100%;box-sizing:border-box}
+pre{background:#f4f4f4;padding:8px;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:3px 6px;text-align:left}
+img,video{max-width:100%}.row{display:flex;gap:6px}.row>input{flex:1}
+</style></head><body>
+<h1>muse2api</h1>
+<div class="row"><input id="key" type="password" placeholder="MUSE2API_KEY"><button onclick="saveKey()">保存</button></div>
+
+<h2>账号</h2>
+<div id="accs">…</div>
+<textarea id="ck" rows="2" placeholder="粘贴 cookie 串（a=1; b=2），可前面加「标签 |」"></textarea>
+<button onclick="addAcc()">添加账号</button> <button onclick="loadAccs()">刷新</button>
+
+<h2>对话</h2>
+<textarea id="chatIn" rows="3" placeholder="输入消息"></textarea>
+<button onclick="chat()">发送（流式）</button>
+<pre id="chatOut"></pre>
+
+<h2>生图</h2>
+<textarea id="imgIn" rows="2" placeholder="图片描述"></textarea>
+<button onclick="gen()">生成</button>
+<div id="imgOut"></div>
+
+<h2>生视频</h2>
+<textarea id="vidIn" rows="2" placeholder="视频描述"></textarea>
+<button onclick="vid()">生成</button> <span id="vidSt"></span>
+<div id="vidOut"></div>
+
+<h2>微信</h2>
+<p>每个 muse 账号绑定一个微信：给哪个账号扫码，那个微信发来的消息就用那个账号的对话。</p>
+<div id="wxList">…</div><button onclick="wxStatus()">刷新</button>
+<div id="wxQr"></div><pre id="wxOut"></pre>
+
+<script>
+const $=id=>document.getElementById(id);
+$('key').value=localStorage.getItem('m2a_key')||'';
+const getK=()=>$('key').value.trim();
+function saveKey(){localStorage.setItem("m2a_key",getK());loadAccs();wxStatus()}
+async function api(path,opt={}){
+  opt.headers={...(opt.headers||{}),Authorization:'Bearer '+getK()};
+  if(opt.json){opt.body=JSON.stringify(opt.json);opt.headers['Content-Type']='application/json';delete opt.json}
+  const r=await fetch(path,opt);const t=await r.text();let d;try{d=JSON.parse(t)}catch{d=t}
+  if(!r.ok)throw new Error((d&&(d.error&&d.error.message||d.detail))||t);return d}
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function loadAccs(){
+  try{const d=await api('/admin/accounts');
+  $('accs').innerHTML='<table><tr><th>标签</th><th>状态</th><th>备注</th><th></th></tr>'+d.accounts.map(a=>
+   `<tr><td>${esc(a.label||a.id)}</td><td>${a.ok===true?'正常':a.ok===false?'失效':'未知'}${a.enabled===false?'（禁用）':''}</td><td>${esc(a.note||'')}</td>
+   <td><button onclick="testAcc('${a.id}')">测试</button><button onclick="delAcc('${a.id}')">删除</button></td></tr>`).join('')+'</table>'}
+  catch(e){$('accs').textContent=e.message}}
+async function addAcc(){try{await api('/admin/accounts',{method:'POST',json:{batch:$('ck').value}});$('ck').value='';loadAccs()}catch(e){alert(e.message)}}
+async function testAcc(id){try{const r=await api('/admin/accounts/'+id+'/test',{method:'POST'});alert(r.message||JSON.stringify(r))}catch(e){alert(e.message)}loadAccs()}
+async function delAcc(id){if(confirm('删除？')){await api('/admin/accounts/'+id,{method:'DELETE'});loadAccs()}}
+async function chat(){
+  $('chatOut').textContent='…';
+  try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+getK(),'Content-Type':'application/json'},
+    body:JSON.stringify({model:'muse-spark',stream:true,messages:[{role:'user',content:$('chatIn').value}]})});
+  if(!r.ok){$('chatOut').textContent=await r.text();return}
+  const rd=r.body.getReader(),dec=new TextDecoder();let buf='',out='';$('chatOut').textContent='';
+  for(;;){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
+    const parts=buf.split('\n\n');buf=parts.pop();
+    for(const p of parts){const l=p.replace(/^data: ?/,'');if(!l||l==='[DONE]')continue;
+      try{const c=JSON.parse(l).choices?.[0]?.delta?.content;if(c){out+=c;$('chatOut').textContent=out}}catch{}}}}
+  catch(e){$('chatOut').textContent=e.message}}
+async function gen(){$('imgOut').textContent='生成中…';
+  try{const d=await api('/v1/images/generations',{method:'POST',json:{model:'muse-image',prompt:$('imgIn').value}});
+  $('imgOut').innerHTML=d.data.map(x=>`<img src="${x.url||'data:image/png;base64,'+x.b64_json}">`).join('')}
+  catch(e){$('imgOut').textContent=e.message}}
+async function vid(){$('vidSt').textContent='提交中…';
+  try{const t=await api('/v1/videos',{method:'POST',json:{model:'muse-video',prompt:$('vidIn').value}});
+  for(;;){await new Promise(r=>setTimeout(r,4000));const s=await api('/v1/videos/'+t.task_id);
+    $('vidSt').textContent=s.status+' '+(s.progress||0)+'%';
+    if(s.status==='completed'){$('vidOut').innerHTML=`<video controls src="${s.url}"></video>`;break}
+    if(s.status==='failed'){$('vidSt').textContent='失败：'+(s.error||'');break}}}
+  catch(e){$('vidSt').textContent=e.message}}
+let wxTimer;
+async function wxLogin(id){try{const d=await api('/admin/weixin/'+id+'/login',{method:'POST'});
+  $('wxQr').innerHTML=d.svg?`<div style="width:240px;background:#fff;padding:8px">${d.svg}</div>`:`<a href="${esc(d.content)}" target="_blank">${esc(d.content)}</a>`;
+  clearInterval(wxTimer);wxTimer=setInterval(()=>wxPoll(id),2500)}catch(e){$('wxOut').textContent=e.message}}
+async function wxPoll(id){try{const d=await api('/admin/weixin/'+id+'/login/status');$('wxOut').textContent=d.status;
+  if(d.status==='connected'){clearInterval(wxTimer);$('wxQr').innerHTML='';wxStatus()}}catch(e){$('wxOut').textContent=e.message;clearInterval(wxTimer)}}
+async function wxLogout(id){if(confirm('断开这个账号的微信？')){await api('/admin/weixin/'+id+'/logout',{method:'POST'});wxStatus()}}
+async function wxAllow(id){const v=prompt('额外允许的微信用户 ID（逗号分隔，扫码本人已默认允许）：');if(v===null)return;
+  const cur=(await api('/admin/weixin')).bots.find(b=>b.account_id===id).allow_from||[];
+  await api('/admin/weixin/'+id+'/allow',{method:'POST',json:{users:[...new Set([...cur,...v.split(',').map(x=>x.trim()).filter(Boolean)])]}});wxStatus()}
+async function wxStatus(){try{const d=await api('/admin/weixin');
+  $('wxList').innerHTML='<table><tr><th>muse 账号</th><th>微信</th><th></th></tr>'+d.bots.map(b=>
+   `<tr><td>${esc(b.label)}</td><td>${b.status==='connected'?'已连接 '+esc(b.user_id||''):b.status==='expired'?'已失效，需重扫':'未连接'}</td>
+   <td><button onclick="wxLogin('${b.account_id}')">${b.status==='connected'?'重新扫码':'扫码绑定'}</button>
+   ${b.status==='connected'?`<button onclick="wxAllow('${b.account_id}')">放行他人</button><button onclick="wxLogout('${b.account_id}')">断开</button>`:''}</td></tr>`).join('')+'</table>'}
+  catch(e){$('wxList').textContent=e.message}}
+if(getK()){loadAccs();wxStatus()}
+</script></body></html>

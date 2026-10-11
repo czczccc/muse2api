@@ -139,3 +139,80 @@ if __name__ == "__main__":
     test_send_file_item()
     test_expired_session()
     print("weixin tests OK")
+
+
+def test_compact_replies_limits_messages():
+    many = [("text", f"段落{i}") for i in range(11)] + [("media", "/x.png", "image")] * 3
+    out = W.compact_replies(many)
+    n = sum(len(W.split_text(r[1])) if r[0] == "text" else 1 for r in out)
+    assert n <= W.MAX_REPLIES, (n, out)
+    assert out[0][0] == "text" and "段落10" in out[0][1], "相邻文本应合并成一条"
+    big = [("text", "a" * 1700 + "\n" + "b" * 1700 * 12)]
+    out = W.compact_replies(big)
+    assert sum(len(W.split_text(r[1])) for r in out) <= W.MAX_REPLIES
+
+
+def test_send_retries_without_token_on_prepare_failed():
+    calls = []
+
+    class C(W.ILinkClient):
+        def _post(self, path, body, timeout=15):
+            calls.append(body["msg"]["context_token"])
+            return {"ret": -2, "errmsg": "prepare failed"} if body["msg"]["context_token"] else {}
+
+    C(token="t").send_text("u", "hi", "tok")
+    assert calls == ["tok", ""], calls
+
+
+def test_typing_and_ctx_persist():
+    d = tempfile.mkdtemp()
+    seen = []
+
+    class TC(FakeClient):
+        def get_typing_ticket(self, user, ctx):
+            return "TICKET"
+
+        def send_typing(self, user, ticket, typing=True):
+            seen.append((ticket, typing))
+
+    FakeClient.sent = []
+    bot = W.WeixinBot(os.path.join(d, "wx.json"), lambda u, t: (time.sleep(0.2), [("text", "ok")])[1],
+                      client_factory=TC)
+    bot.state["bot_token"] = "x"
+    bot._dispatch({"message_type": 1, "message_id": 1, "from_user_id": "u1", "context_token": "ctx1",
+                   "item_list": [{"type": 1, "text_item": {"text": "hi"}}]})
+    bot.allow_env = ["u1"]
+    bot._dispatch({"message_type": 1, "message_id": 2, "from_user_id": "u1", "context_token": "ctx2",
+                   "item_list": [{"type": 1, "text_item": {"text": "hi"}}]})
+    time.sleep(0.8)
+    assert seen and seen[0] == ("TICKET", True) and seen[-1] == ("TICKET", False), seen
+    bot2 = W.WeixinBot(os.path.join(d, "wx.json"), lambda u, t: [], client_factory=TC)
+    assert bot2._ctx.get("u1") == "ctx2", "context_token 应该存盘，重启后还在"
+
+
+def test_emit_sends_early_and_respects_budget():
+    d = tempfile.mkdtemp()
+    FakeClient.sent = []
+    flags = []
+
+    def handler(user, text, emit=None):
+        flags.append(emit([("text", "第一段")]))
+        for i in range(12):                      # 预算用完后 emit 应该拒绝
+            flags.append(emit([("text", f"p{i}")]))
+        return [("text", "最后")]
+
+    bot = W.WeixinBot(os.path.join(d, "wx.json"), handler, client_factory=FakeClient)
+    bot.state["bot_token"] = "x"
+    bot._handle("u1", "hi", "ctx")
+    texts = [s[2] for s in FakeClient.sent if s[0] == "text"]
+    assert texts[0] == "第一段" and texts[-1] == "最后", texts
+    assert flags[0] is True and flags[-1] is False, flags
+    assert len(texts) <= W.MAX_REPLIES, texts
+
+
+def test_aes_roundtrip_and_key_parse():
+    key = bytes(range(16))
+    assert W.aes_ecb_decrypt(W.aes_ecb_encrypt(b"hello", key), key) == b"hello"
+    assert W._parse_aes_key({"aeskey": key.hex()}) == key
+    assert W._parse_aes_key({"media": {"aes_key": base64.b64encode(key.hex().encode()).decode()}}) == key
+    assert W._parse_aes_key({"media": {"aes_key": base64.b64encode(key).decode()}}) == key

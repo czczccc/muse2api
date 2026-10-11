@@ -14,6 +14,7 @@ import urllib.request
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -40,6 +41,83 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+WARM_IDLE_SECONDS = int(os.environ.get("MUSE2API_WARM_IDLE", "1800"))   # 常驻页面空闲多久后关闭
+
+
+class _ChatRunner:
+    """某账号的常驻对话线程：页面是按线程隔离的，对话固定在同一个线程里跑，
+    页面就能在两条消息之间保持打开，省掉每次开页、注入 cookie、加载会话的几秒到几十秒。
+    空闲期间定期检查页面是否健康，坏了就重开（预热），超过 idle 秒没人用才关闭。"""
+
+    def __init__(self, engine, idle: float = WARM_IDLE_SECONDS):
+        self.engine = engine
+        self.idle = idle
+        self.tick = min(60.0, idle)
+        self.last_used = time.time()
+        self.warm_args = None          # (cookies, expires, account_id)：重开页面用
+        self.jobs: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="muse-chat-runner")
+        self.thread.start()
+
+    def _warm(self):
+        if not self.warm_args:
+            return
+        try:
+            self.engine.warm_chat_page(*self.warm_args)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("预热对话页面失败（不影响使用，下条消息会重新打开）: %s", exc)
+            self.engine._close_page()
+
+    def _maintain(self):
+        if time.time() - self.last_used > self.idle:
+            self.engine._close_page()      # 空闲太久，释放页面；下次请求再开
+            return
+        check = getattr(self.engine, "_page_healthy", None)
+        if check is not None and self.engine.page is not None and not check():
+            log.info("常驻对话页面已失效，重新预热")
+            self.engine._close_page()
+            self._warm()
+
+    def _loop(self):
+        while True:
+            try:
+                job = self.jobs.get(timeout=self.tick)
+            except queue.Empty:
+                self._maintain()
+                continue
+            if job[0] == "warm":
+                self.warm_args = job[1]
+                self.last_used = time.time()
+                self._warm()
+                continue
+            _, out, args, kwargs = job
+            self.warm_args = (args[0], args[2], kwargs.get("account_id"))
+            try:
+                for chunk in self.engine.chat_stream(*args, **kwargs):
+                    out.put(("data", chunk))
+            except BaseException as exc:  # noqa: BLE001
+                out.put(("error", exc))
+                self.engine._close_page()      # 出错后别留着可能已坏的页面
+            finally:
+                self.last_used = time.time()
+                out.put(("done", None))
+
+    def warm(self, cookies, expires, account_id):
+        self.jobs.put(("warm", (cookies, expires, account_id)))
+
+    def run(self, *args, **kwargs):
+        out: queue.Queue = queue.Queue()
+        self.jobs.put(("chat", out, args, kwargs))
+        while True:
+            kind, val = out.get()
+            if kind == "data":
+                yield val
+            elif kind == "error":
+                raise val
+            else:
+                return
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -48,6 +126,8 @@ class MuseEngine:
         self._local = threading.local()
         self._start_lock = threading.Lock()
         self._chat_urls: dict = {}
+        self._runners: dict[str, _ChatRunner] = {}
+        self._runners_lock = threading.Lock()
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
         self._last_http_renew: dict[str, float] = {}
@@ -187,7 +267,8 @@ class MuseEngine:
                 self._active_contexts.discard(ctx_id)
             self.current_context_id = None
         self.current_acc_id = None
-        self._chat_urls.clear()
+        # 注意：不要在这里清 _chat_urls。每次请求结束都会关页面，
+        # 绑定的对话会话 URL 要跨请求保留；只有 /重置 才通过 forget_chat_binding 清掉。
 
     def _open_page(self):
         """为当前工作线程创建独立的页面。
@@ -419,7 +500,28 @@ class MuseEngine:
         if not self.page:
             return False
         try:
-            clicked = self.page.js("""(function(){
+            clicked = False
+            t_find = time.time() + 8.0      # 新开的页面侧栏可能还没渲染出来，等一等再放弃
+            while not clicked and time.time() < t_find:
+                clicked = self._click_main_chat()
+                if not clicked:
+                    time.sleep(0.5)
+            if not clicked:
+                return False
+            t_end = time.time() + 10.0
+            while time.time() < t_end:
+                time.sleep(0.1)
+                if self.page.js("!!document.querySelector('textarea')"):
+                    break
+            time.sleep(0.6)
+            self._wait_ws_ready(self.page, timeout=12.0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _click_main_chat(self) -> bool:
+        try:
+            return bool(self.page.js("""(function(){
                 var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
                 function clickable(el){
                     var n = el;
@@ -442,17 +544,7 @@ class MuseEngine:
                     if (re.test(v)) { clickable(attrs[i]).click(); return true; }
                 }
                 return false;
-            })()""")
-            if not clicked:
-                return False
-            t_end = time.time() + 10.0
-            while time.time() < t_end:
-                time.sleep(0.1)
-                if self.page.js("!!document.querySelector('textarea')"):
-                    break
-            time.sleep(0.6)
-            self._wait_ws_ready(self.page, timeout=12.0)
-            return True
+            })()"""))
         except Exception:  # noqa: BLE001
             return False
 
@@ -490,9 +582,19 @@ class MuseEngine:
                 return
             time.sleep(0.1)
 
-    def forget_chat_binding(self):
-        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）。"""
-        self._chat_urls.clear()
+    def _close_dialog(self):
+        try:
+            self.page.js("""(function(){var d=document.querySelector('[role="dialog"]');
+                if(d){var b=d.querySelector('button[aria-label*="close" i], button'); if(b) b.click();}})()""")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def forget_chat_binding(self, account_id: str | None = None):
+        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）；指定账号则只清它的。"""
+        if account_id:
+            self._chat_urls.pop(account_id, None)
+        else:
+            self._chat_urls.clear()
 
     def _enter_chat(self, account_id, prompt: str, fallback_prompt: str | None):
         """进入持续对话的会话，返回 (要发送的提示词, 是否新会话)。
@@ -525,7 +627,8 @@ class MuseEngine:
                 return
             time.sleep(0.2)
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None,
+                    start_url: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
             try:
                 if self.page.js("!!document.querySelector('textarea')"):
@@ -555,7 +658,7 @@ class MuseEngine:
 
         page = self._open_page()
         self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        page.send("Page.navigate", {"url": start_url or "https://muse.ai/thread/new"})
         for _ in range(self.cfg.login_wait * 2):
             time.sleep(0.15)
             try:
@@ -1017,7 +1120,7 @@ class MuseEngine:
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
-        "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
+        "var nonEmpty=bs.filter(function(b){var t=(b.innerText||'').trim();return t.length>0&&!/^[^\\w\\u4e00-\\u9fff]{0,4}(小贴士|贴士|Tip)\\s*\\d*\\s*[:：]/i.test(t);});"
         "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
         "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
         "||document.querySelector('button[aria-label*=\"Stop\" i]')"
@@ -1049,7 +1152,7 @@ class MuseEngine:
         "(function(){"
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
-        ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'')&&((b.innerText||'').trim().length>0);});"
+        ".filter(function(b){var t=(b.innerText||'').trim();return /hatch-agent-bubble-bg/.test(b.className||'')&&t.length>0&&!/^[^\\w\\u4e00-\\u9fff]{0,4}(小贴士|贴士|Tip)\\s*\\d*\\s*[:：]/i.test(t);});"
         "var last=bs[bs.length-1];var out=[],picked=[];if(!last)return '[]';"
         "var els=last.querySelectorAll('button,[role=\"button\"],a,div,span');"
         "for(var i=0;i<els.length;i++){var el=els[i];"
@@ -1070,17 +1173,34 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return []
 
-    # 页面上的授权/确认弹窗（role=dialog / alertdialog），返回正文和按钮文字
+    # 页面上的授权/确认弹窗：先找 role=dialog / alertdialog；找不到再找聊天里内嵌的授权卡片
+    # （同一个容器里同时有「允许」和「拒绝」类按钮）。返回正文和按钮文字。
+    _DLG_FIND = (
+        "function findDlg(){"
+        "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
+        "function lab(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');}"
+        "function btns(d){return [].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
+        "var t=lab(b);return t&&t.length<80&&vis(b);});}"
+        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]')).filter(vis);"
+        "var d=ds[ds.length-1];"
+        "if(d){var bs=btns(d);if(bs.length)return {d:d,bs:bs};}"
+        "var ALLOW=/^(允许|同意|批准|授权|始终允许|仅此一次|allow|approve|accept|always allow|allow once)/i;"
+        "var DENY=/^(拒绝|不允许|不同意|deny|reject|decline)/i;"
+        "var all=btns(document.body);"
+        "var okb=all.filter(function(b){return ALLOW.test(lab(b));});"
+        "if(!okb.length)return null;"
+        "var c=okb[okb.length-1].parentElement;"
+        "for(var i=0;c&&i<6;i++,c=c.parentElement){"
+        "var bs2=btns(c);"
+        "if(bs2.some(function(b){return DENY.test(lab(b));})&&bs2.some(function(b){return ALLOW.test(lab(b));}))"
+        "return {d:c,bs:bs2};}"
+        "return null;}"
+    )
     _DIALOG_JS = (
-        "(function(){"
-        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'))"
-        ".filter(function(d){var r=d.getBoundingClientRect();return r.width>0&&r.height>0;});"
-        "var d=ds[ds.length-1];if(!d)return '';"
-        "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]'))"
-        ".map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');})"
-        ".filter(function(t){return t&&t.length<80;});"
-        "if(!bs.length)return '';"
-        "var txt=(d.innerText||'').trim();"
+        "(function(){" + _DLG_FIND +
+        "var f=findDlg();if(!f)return '';"
+        "var bs=f.bs.map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');});"
+        "var txt=(f.d.innerText||'').trim();"
         "return JSON.stringify({text:txt.slice(0,600),buttons:bs});})()"
     )
     _DENY_RE = re.compile(r"拒绝|不允许|不同意|取消|^否$|\bdeny|\breject|\bdecline|\bcancel|^no$", re.I)
@@ -1095,11 +1215,8 @@ class MuseEngine:
     def _click_dialog_button(self, idx: int) -> bool:
         try:
             return bool(self.page.js(
-                "(function(i){var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'));"
-                "var d=ds[ds.length-1];if(!d)return false;"
-                "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
-                "var t=(b.innerText||b.getAttribute('aria-label')||'').trim();return t&&t.length<80;});"
-                "if(!bs[i])return false;bs[i].click();return true;})(%d)" % int(idx)))
+                "(function(i){" + self._DLG_FIND +
+                "var f=findDlg();if(!f||!f.bs[i])return false;f.bs[i].click();return true;})(%d)" % int(idx)))
         except Exception:  # noqa: BLE001
             return False
 
@@ -1175,17 +1292,23 @@ class MuseEngine:
         return lines[0]||'file';
       }
       var allAtt=[].slice.call(scope.querySelectorAll(ATT));
-      var units=scope.querySelectorAll('div[class*="hatch-agent-bubble-bg"],'+ATT);
+      var units=scope.querySelectorAll('div[class*="chat-user-bubble"],div[class*="hatch-agent-bubble-bg"],'+ATT);
       var items=[];
       for(var i=0;i<units.length;i++){
         var u=units[i];
+        if(u.matches('[class*="chat-user-bubble"]')){ items.push({k:'u'}); continue; }
         if(inUser(u)) continue;
         if(u.matches(ATT)){
-          if(u.querySelector('img,video')&&!/\.[A-Za-z0-9]{1,8}\s*$/.test((u.innerText||'').trim())) continue;
+          var mm=u.querySelector('img,video');
+          if(mm&&!/\.[A-Za-z0-9]{1,8}\s*$/.test((u.innerText||'').trim())){
+            var ms=mm.currentSrc||mm.src||'';
+            if(ms) items.push({k:'m',kind:mm.tagName==='VIDEO'?'video':'image',src:ms,idx:allAtt.indexOf(u)});
+            continue;
+          }
           items.push({k:'f',name:nameOf(u),idx:allAtt.indexOf(u)});
         }else if(!u.closest(ATT)){
           var t=conv(u).replace(/\n{3,}/g,NL+NL).trim();
-          if(t) items.push({k:'t',v:t});
+          if(t&&!/^[^\w\u4e00-\u9fff]{0,4}(小贴士|贴士|Tip)\s*\d*\s*[:：]/i.test(t)) items.push({k:'t',v:t});
         }
       }
       return JSON.stringify(items);
@@ -1256,15 +1379,92 @@ class MuseEngine:
             log.warning("取回附件 %s 失败: %s", name, exc)
         return None
 
-    def _report_turn(self, on_turn, base: int):
-        """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。"""
-        if on_turn is None:
-            return
-        time.sleep(0.4)
-        items = self._poll_turn()[base:]
+    _ATT_DEBUG_JS = r"""(function(){
+      var scope=document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]')||document.body;
+      var n=[].slice.call(scope.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'));
+      return JSON.stringify(n.slice(-4).map(function(u){var m=u.querySelector('img,video');
+        return {tid:u.getAttribute('data-testid'),media:m?m.tagName:'',src:m?((m.currentSrc||m.src||'').slice(0,60)):'',
+                text:(u.innerText||'').trim().slice(0,40)};}));
+    })()"""
+
+    @staticmethod
+    def _turn_sig(it: dict) -> tuple:
+        return (it.get("k"), it.get("v") or it.get("src") or it.get("name") or "")
+
+    def _turn_baseline(self):
+        """发送前页面上已有的气泡/附件签名。按内容而不是按下标区分「这一轮新增」：
+        主要聊天的历史会分批加载，按下标切片会把旧图、旧文件又当成新回复发一遍。"""
+        from collections import Counter
+        return Counter(self._turn_sig(i) for i in self._poll_turn())
+
+    def _new_turn_items(self, base) -> list[dict]:
+        """本轮新增的回复 = 页面里最后一条用户消息（刚发的那条）之后的所有内容。
+        这样不受聊天历史分批加载、下标变化的影响；看不到用户气泡时才退回按基线内容比对。"""
+        cur = self._poll_turn()
+        last_u = max((i for i, it in enumerate(cur) if it.get("k") == "u"), default=-1)
+        if last_u >= 0:
+            return [it for it in cur[last_u + 1:] if it.get("k") != "u"]
+        left = base.copy()
+        out = []
+        for it in cur:
+            sig = self._turn_sig(it)
+            if left[sig] > 0:
+                left[sig] -= 1
+            else:
+                out.append(it)
+        return out
+
+    def _materialize(self, items: list[dict]):
+        """把文件/图片/视频项的字节取回来（失败则 data=None）。"""
         for it in items:
             if it.get("k") == "f":
                 it["data"] = self._fetch_attachment(it["idx"], it["name"])
+            elif it.get("k") == "m":
+                try:
+                    it["data"], it["mime"], _ = self.extract_bytes(it["src"], it.get("kind", "image"), retries=2)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("取回聊天里的%s失败: %s", it.get("kind"), exc)
+                    it["data"] = None
+
+    def _emit_partial(self, on_partial, base, n_emitted: list):
+        """生成过程中把已经完成的气泡/附件先交出去（最后一项可能还在生成，留到结束时）。"""
+        ready = self._new_turn_items(base)[:-1]
+        if len(ready) > n_emitted[0]:
+            new = ready[n_emitted[0]:]
+            self._materialize(new)
+            if on_partial(new) is not False:
+                n_emitted[0] = len(ready)
+
+    def _report_turn(self, on_turn, base, wait_media: float = 0.0, skip: int = 0):
+        """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。
+        wait_media>0（用户在要图/视频/文件）时，文字说完后附件可能还在生成，最多再等这么多秒。"""
+        if on_turn is None:
+            return
+        time.sleep(0.4)
+        items = self._new_turn_items(base)
+        if wait_media:
+            t_end = time.time() + wait_media
+            stable_since = time.time()
+            while time.time() < t_end:
+                has_media = any(i.get("k") in ("m", "f") for i in items)
+                if has_media and time.time() - stable_since >= 2.0:
+                    break
+                time.sleep(0.5)
+                cur = self._new_turn_items(base)
+                if len(cur) != len(items):
+                    stable_since = time.time()
+                items = cur
+            log.info("等待附件结束，当前轮次共 %d 项", len(items))
+        try:
+            log.info("页面附件现状: %s", self.page.js(self._ATT_DEBUG_JS))
+        except Exception:  # noqa: BLE001
+            pass
+        items = items[skip:]          # 前 skip 项已经在生成过程中先发出去了
+        self._materialize(items)
+        log.info("本轮回复解析：文本 %d 段、文件 %d 个、图片/视频 %d 个",
+                 sum(1 for i in items if i.get("k") == "t"),
+                 sum(1 for i in items if i.get("k") == "f"),
+                 sum(1 for i in items if i.get("k") == "m"))
         if items:
             on_turn(items)
 
@@ -1290,21 +1490,42 @@ class MuseEngine:
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, main_chat: bool = False,
                     fallback_prompt: str | None = None, on_options=None,
-                    on_prompt=None, on_turn=None):
+                    on_prompt=None, on_turn=None, on_partial=None):
         """发一条消息，流式 yield 增量文本。
 
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
         进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
+        t_begin = time.time()
+        bound = self._chat_urls.get(account_id or "_") if main_chat else None
+        try:
+            # 已绑定会话时直接以该会话地址开页，省掉先开 /thread/new 再跳转的一次整页加载
+            self.ensure_page(cookies, expires, account_id=account_id, start_url=bound)
+        except MuseGenerationError:
+            if not bound:
+                raise
+            log.info("微信对话：绑定的会话 %s 打不开，改用新会话", bound)
+            self._chat_urls.pop(account_id or "_", None)
+            self.ensure_page(cookies, expires, account_id=account_id)
+        t_page = time.time()
         fresh = False
         if main_chat:
-            self.reset_thread(for_chat=True, keep_page=True)
+            self._close_dialog()
             prompt, fresh = self._enter_chat(account_id, prompt, fallback_prompt)
         else:
             self.reset_thread(for_chat=True)
+        # 要图/视频：附件常在文字说完之后才出现，多等；只是提到文件/生成等词的，只短等一下，避免平白加延迟
+        if re.search(r"图|画|照片|海报|视频|image|picture|photo|video|draw", prompt or "", re.I):
+            want_media = 45.0
+        elif re.search(r"文件|生成|导出|下载|file|generate|export|download", prompt or "", re.I):
+            want_media = 5.0
+        else:
+            want_media = 0.0
+        if on_turn is not None and main_chat:
+            self._wait_chat_loaded()      # 历史分批加载，等稳定了再取基线
         base_agent, base_text, _ = self._poll_chat()
-        base_turn = len(self._poll_turn()) if on_turn is not None else 0
+        base_turn = self._turn_baseline() if on_turn is not None else None
+        t_ready = time.time()
         self._send(prompt)
         if main_chat and fresh:
             self._remember_thread(account_id)
@@ -1316,6 +1537,7 @@ class MuseEngine:
         got_first = False
         last_dlg = [0.0]
         last_cnt = -1
+        n_emitted, last_part = [0], [0.0]
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
@@ -1329,6 +1551,10 @@ class MuseEngine:
                     deadline += waited
                     first_token_deadline += waited
             cnt, cur, has_stop = self._poll_chat()
+            if has_stop:
+                # 助手还在干活（执行命令、联网等）没有吐字：只要「停止」按钮还在就继续等，
+                # 总时限仍受 timeout 约束，不再 40 秒就判定首字超时
+                first_token_deadline = deadline
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
                     try:
@@ -1342,12 +1568,19 @@ class MuseEngine:
             delta = cur[len(sent):] if cur.startswith(sent) else cur
             if delta:
                 sent = cur
+                log.info("对话耗时：开页 %.1fs、进会话+取基线 %.1fs、首字 %.1fs",
+                         t_page - t_begin, t_ready - t_page, time.time() - t_ready)
                 yield delta
                 last = cur
                 got_first = True
                 break
 
         if not got_first:
+            try:
+                tail = (self.page.js("document.body.innerText.slice(-400)") or "").replace("\n", " ⏎ ")
+                log.warning("首字超时，页面末尾内容：%s", tail)
+            except Exception:  # noqa: BLE001
+                pass
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
@@ -1358,6 +1591,12 @@ class MuseEngine:
             if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
                 last_dlg[0] = time.time()
                 deadline += self.handle_dialog(on_prompt)
+            if on_partial is not None and on_turn is not None and time.time() - last_part[0] > 1.0:
+                last_part[0] = time.time()
+                try:
+                    self._emit_partial(on_partial, base_turn, n_emitted)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("分段先发失败（忽略，结束时一并发送）: %s", exc)
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue
@@ -1375,15 +1614,64 @@ class MuseEngine:
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media, skip=n_emitted[0])
+                    log.info("对话耗时：从发送到结束共 %.1fs", time.time() - t_ready)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= (600 if on_turn is not None else 80):
                     self._report_options(on_options)
-                    self._report_turn(on_turn, base_turn)
+                    self._report_turn(on_turn, base_turn, wait_media=want_media, skip=n_emitted[0])
                     return
 
         raise MuseGenerationError("等待助手回复超时")
+
+    def _runner(self, account_id: str | None) -> "_ChatRunner":
+        key = account_id or "_"
+        with self._runners_lock:
+            runner = self._runners.get(key)
+            if runner is None:
+                runner = self._runners[key] = _ChatRunner(self)
+        return runner
+
+    def chat_stream_warm(self, cookies: dict, prompt: str, expires: dict | None = None,
+                         timeout: int | None = None, account_id: str | None = None, **kwargs):
+        """同 chat_stream，但在该账号的常驻线程里执行，页面在请求之间保持打开。"""
+        return self._runner(account_id).run(cookies, prompt, expires, timeout,
+                                            account_id=account_id, **kwargs)
+
+    def prewarm_chat(self, cookies: dict, expires: dict | None, account_id: str | None):
+        """提前在该账号的常驻线程里打开对话页面（不阻塞），让第一条消息也是快的。"""
+        self._runner(account_id).warm(cookies, expires, account_id)
+
+    def warm_chat_page(self, cookies: dict, expires: dict | None, account_id: str | None):
+        """（在常驻线程里执行）把页面开到已绑定的会话，没有绑定就尝试进「主要聊天」并绑定。"""
+        key = account_id or "_"
+        self.start()
+        bound = self._chat_urls.get(key)
+        try:
+            self.ensure_page(cookies, expires, account_id=account_id, start_url=bound)
+        except MuseGenerationError:
+            if not bound:
+                raise
+            self._chat_urls.pop(key, None)
+            bound = None
+            self.ensure_page(cookies, expires, account_id=account_id)
+        self._close_dialog()
+        if not bound and self.open_main_chat():
+            u = self._page_url()
+            if u:
+                self._chat_urls[key] = u
+        self._wait_chat_loaded()
+        log.info("对话页面已预热：%s", self._page_url())
+
+    def _page_healthy(self) -> bool:
+        try:
+            return bool(self.page.js(
+                "(function(){var t=document.body?document.body.innerText:'';"
+                "return !!document.querySelector('textarea')&&t.indexOf('Still sending')===-1"
+                "&&t.indexOf('Connecting...')===-1;})()"))
+        except Exception:  # noqa: BLE001
+            return False
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:

@@ -27,9 +27,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制代码与必要目录
-COPY *.py version.json ./
+COPY *.py admin.html version.json ./
 COPY deploy/ ./deploy/
 COPY tools/ ./tools/
+COPY mgateway/ ./mgateway/
 
 # 创建持久化数据目录
 RUN mkdir -p /app/data/media /app/data/downloads /root/muse2api-profiles
