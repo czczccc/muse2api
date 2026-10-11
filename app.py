@@ -2478,7 +2478,8 @@ def _qr_svg(content: str) -> str:
     except ImportError:
         return ""
     buf = io.BytesIO()
-    segno.make(content, error="m").save(buf, kind="svg", scale=6, border=2, xmldecl=False)
+    segno.make(content, error="m").save(buf, kind="svg", scale=1, border=2, xmldecl=False,
+                                        omitsize=True, svgclass=None, lineclass=None)
     return buf.getvalue().decode()
 
 

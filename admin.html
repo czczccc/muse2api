@@ -571,7 +571,7 @@
       </div>
       <div id="wxState" style="margin:12px 0;font-weight:600">加载中…</div>
       <div id="wxQrBox" style="display:none;margin:12px 0">
-        <div id="wxQr" style="width:220px;height:220px;background:#fff;padding:8px;border-radius:8px"></div>
+        <div id="wxQr" style="width:220px;height:220px;box-sizing:border-box;overflow:hidden;background:#fff;padding:8px;border-radius:8px"></div>
         <div class="hint" id="wxQrHint" style="margin-top:8px"></div>
       </div>
       <div id="wxAllowBox" style="display:none;margin:12px 0">
@@ -932,7 +932,11 @@ async function wxLogin(){
   try{
     const d = await api('/admin/weixin/login', {method:'POST'});
     $('wxQrBox').style.display = '';
-    if (d.svg) $('wxQr').innerHTML = d.svg;
+    if (d.svg){
+      $('wxQr').innerHTML = d.svg;
+      const sv = $('wxQr').querySelector('svg');
+      if (sv){ sv.style.cssText = 'display:block;width:100%;height:100%'; }
+    }
     else $('wxQr').innerHTML = '<a href="' + esc(d.content) + '" target="_blank" style="color:#000;word-break:break-all">' + esc(d.content) + '</a>';
     $('wxQrHint').textContent = WX_LOGIN_TEXT.wait;
     wxStopPoll();
