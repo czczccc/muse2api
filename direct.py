@@ -55,6 +55,23 @@ def _has_attachment(ev: dict) -> bool:
                if re.search(r"attach|media|file|image|video|artifact", k, re.I))
 
 
+def _presentation_media(p: dict) -> list[dict]:
+    """delta.presentation 里的图片：data.images[]，带 sandbox:// 路径和 variants.original 原图链接。"""
+    out = []
+    data = p.get("data") if isinstance(p.get("data"), dict) else {}
+    for key in ("images", "videos", "files"):
+        for im in data.get(key) or []:
+            if not isinstance(im, dict) or im.get("missing"):
+                continue
+            path = (im.get("path") or "").replace("sandbox://", "")
+            v = im.get("variants") if isinstance(im.get("variants"), dict) else {}
+            url = v.get("original") or next((x for x in v.values() if isinstance(x, str)), None)
+            out.append({"url": None, "alt_url": url, "artifact_id": None, "path": path or None,
+                        "name": os.path.basename(path) if path else (im.get("label") or ""),
+                        "mime": im.get("mime") or ""})
+    return out or _find_media(p)
+
+
 def _find_media(obj, out=None) -> list[dict]:
     """在回复记录里找附件：带 http(s) 链接，或带 artifact/handle id 的字典。字段名还没实测，尽量宽松。"""
     out = [] if out is None else out
@@ -123,14 +140,24 @@ class DirectClient:
         url = m.get("url")
         try:
             if m.get("path") and not url:
-                return self._fs_read(m["path"])
+                try:
+                    data, mime = self._fs_read(m["path"])
+                    if data:
+                        return data, mime
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("fs.read 失败（%s）：%s", m["path"][-60:], str(exc)[:300])
+                url = m.get("alt_url")
+                if not url:
+                    return None, ""
             if not url and m.get("artifact_id"):
                 d = self.gw.call_json("artifacts.fetch_url", body={"artifact_id": m["artifact_id"]})
                 url = (d.get("url") if isinstance(d, dict) else d) or None
                 if not isinstance(url, str):
                     log.info("artifacts.fetch_url 返回：%s", str(d)[:300])
                     return None, ""
-            r = rq.get(url, headers={"Cookie": self.cookie, "Referer": "https://muse.ai/"},
+            r = rq.get(url, headers={"Cookie": self.cookie, "Referer": "https://muse.ai/",
+                                     **({"Authorization": "Bearer " + self.gw.hatch_token}
+                                        if getattr(self.gw, "hatch_token", None) else {})},
                        impersonate="chrome", timeout=60)
             if r.status_code == 200 and r.content:
                 return r.content, r.headers.get("content-type", "")
@@ -261,7 +288,7 @@ class DirectClient:
                     seq = ev.get("seq")
                     if ev.get("event_name") == "delta.presentation" and (seq or 0) > baseline \
                             and seq not in delivered:
-                        media = _find_media(_payload(ev))
+                        media = _presentation_media(_payload(ev))
                         if not media:
                             if str(_payload(ev).get("state") or "").lower() not in ("failed", "error", "cancelled"):
                                 pending = True

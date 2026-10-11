@@ -122,8 +122,10 @@ class Gateway:
         if vm_id is None:
             vm_id = fetch_session_info(cookies)["vm_id"]
         self.vm_id = vm_id
+        self.cookies = cookies
         access_token = access_token or fetch_access_token(cookies)
         hatch_token = hatch_token or fetch_hatch_token(cookies, access_token, vm_id)
+        self.access_token, self.hatch_token = access_token, hatch_token
         url = (f"wss://{GATEWAY_HOST}/v1/noise?vm_id={vm_id}"
                f"&auth_token={urllib.parse.quote(hatch_token, safe='')}")
         self.ws = WebSocket()

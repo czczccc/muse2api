@@ -134,3 +134,12 @@ def test_presentation_image_is_read_via_fs():
     assert got[0] == ("text", "画好了")
     assert got[1] == ("media", b"PNGDATA", "image", "abc.png"), got
     assert FakeGW.reads == ["workspace/user/media_library/image/b8/abc.png"]
+
+
+def test_presentation_media_uses_data_images():
+    p = {"image_path": "workspace/a.webp", "data": {"images": [{"mime": "image/webp", "missing": False,
+         "path": "sandbox://workspace/imagine_media/x.webp",
+         "variants": {"original": "https://vm.metaaivm.com/media/raw/workspace/imagine_media/x.webp"}}]}}
+    m = direct._presentation_media(p)
+    assert m[0]["path"] == "workspace/imagine_media/x.webp" and m[0]["alt_url"].endswith("x.webp")
+    assert m[0]["mime"] == "image/webp"
