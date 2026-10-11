@@ -589,9 +589,12 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             pass
 
-    def forget_chat_binding(self):
-        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）。"""
-        self._chat_urls.clear()
+    def forget_chat_binding(self, account_id: str | None = None):
+        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）；指定账号则只清它的。"""
+        if account_id:
+            self._chat_urls.pop(account_id, None)
+        else:
+            self._chat_urls.clear()
 
     def _enter_chat(self, account_id, prompt: str, fallback_prompt: str | None):
         """进入持续对话的会话，返回 (要发送的提示词, 是否新会话)。
@@ -1170,17 +1173,34 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return []
 
-    # 页面上的授权/确认弹窗（role=dialog / alertdialog），返回正文和按钮文字
+    # 页面上的授权/确认弹窗：先找 role=dialog / alertdialog；找不到再找聊天里内嵌的授权卡片
+    # （同一个容器里同时有「允许」和「拒绝」类按钮）。返回正文和按钮文字。
+    _DLG_FIND = (
+        "function findDlg(){"
+        "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
+        "function lab(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');}"
+        "function btns(d){return [].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
+        "var t=lab(b);return t&&t.length<80&&vis(b);});}"
+        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]')).filter(vis);"
+        "var d=ds[ds.length-1];"
+        "if(d){var bs=btns(d);if(bs.length)return {d:d,bs:bs};}"
+        "var ALLOW=/^(允许|同意|批准|授权|始终允许|仅此一次|allow|approve|accept|always allow|allow once)/i;"
+        "var DENY=/^(拒绝|不允许|不同意|deny|reject|decline)/i;"
+        "var all=btns(document.body);"
+        "var okb=all.filter(function(b){return ALLOW.test(lab(b));});"
+        "if(!okb.length)return null;"
+        "var c=okb[okb.length-1].parentElement;"
+        "for(var i=0;c&&i<6;i++,c=c.parentElement){"
+        "var bs2=btns(c);"
+        "if(bs2.some(function(b){return DENY.test(lab(b));})&&bs2.some(function(b){return ALLOW.test(lab(b));}))"
+        "return {d:c,bs:bs2};}"
+        "return null;}"
+    )
     _DIALOG_JS = (
-        "(function(){"
-        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'))"
-        ".filter(function(d){var r=d.getBoundingClientRect();return r.width>0&&r.height>0;});"
-        "var d=ds[ds.length-1];if(!d)return '';"
-        "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]'))"
-        ".map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');})"
-        ".filter(function(t){return t&&t.length<80;});"
-        "if(!bs.length)return '';"
-        "var txt=(d.innerText||'').trim();"
+        "(function(){" + _DLG_FIND +
+        "var f=findDlg();if(!f)return '';"
+        "var bs=f.bs.map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');});"
+        "var txt=(f.d.innerText||'').trim();"
         "return JSON.stringify({text:txt.slice(0,600),buttons:bs});})()"
     )
     _DENY_RE = re.compile(r"拒绝|不允许|不同意|取消|^否$|\bdeny|\breject|\bdecline|\bcancel|^no$", re.I)
@@ -1195,11 +1215,8 @@ class MuseEngine:
     def _click_dialog_button(self, idx: int) -> bool:
         try:
             return bool(self.page.js(
-                "(function(i){var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'));"
-                "var d=ds[ds.length-1];if(!d)return false;"
-                "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
-                "var t=(b.innerText||b.getAttribute('aria-label')||'').trim();return t&&t.length<80;});"
-                "if(!bs[i])return false;bs[i].click();return true;})(%d)" % int(idx)))
+                "(function(i){" + self._DLG_FIND +
+                "var f=findDlg();if(!f||!f.bs[i])return false;f.bs[i].click();return true;})(%d)" % int(idx)))
         except Exception:  # noqa: BLE001
             return False
 
@@ -1555,6 +1572,11 @@ class MuseEngine:
                 break
 
         if not got_first:
+            try:
+                tail = (self.page.js("document.body.innerText.slice(-400)") or "").replace("\n", " ⏎ ")
+                log.warning("首字超时，页面末尾内容：%s", tail)
+            except Exception:  # noqa: BLE001
+                pass
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本

@@ -34,14 +34,15 @@ img,video{max-width:100%}.row{display:flex;gap:6px}.row>input{flex:1}
 <div id="vidOut"></div>
 
 <h2>微信</h2>
-<button onclick="wxLogin()">获取二维码</button> <button onclick="wxStatus()">刷新状态</button>
+<p>每个 muse 账号绑定一个微信：给哪个账号扫码，那个微信发来的消息就用那个账号的对话。</p>
+<div id="wxList">…</div><button onclick="wxStatus()">刷新</button>
 <div id="wxQr"></div><pre id="wxOut"></pre>
 
 <script>
 const $=id=>document.getElementById(id);
 $('key').value=localStorage.getItem('m2a_key')||'';
 const getK=()=>$('key').value.trim();
-function saveKey(){localStorage.setItem('m2a_key',getK());loadAccs()}
+function saveKey(){localStorage.setItem("m2a_key",getK());loadAccs();wxStatus()}
 async function api(path,opt={}){
   opt.headers={...(opt.headers||{}),Authorization:'Bearer '+getK()};
   if(opt.json){opt.body=JSON.stringify(opt.json);opt.headers['Content-Type']='application/json';delete opt.json}
@@ -80,10 +81,20 @@ async function vid(){$('vidSt').textContent='提交中…';
     if(s.status==='failed'){$('vidSt').textContent='失败：'+(s.error||'');break}}}
   catch(e){$('vidSt').textContent=e.message}}
 let wxTimer;
-async function wxLogin(){try{const d=await api('/admin/weixin/login',{method:'POST'});
+async function wxLogin(id){try{const d=await api('/admin/weixin/'+id+'/login',{method:'POST'});
   $('wxQr').innerHTML=d.svg?`<div style="width:240px;background:#fff;padding:8px">${d.svg}</div>`:`<a href="${esc(d.content)}" target="_blank">${esc(d.content)}</a>`;
-  clearInterval(wxTimer);wxTimer=setInterval(wxPoll,2500)}catch(e){$('wxOut').textContent=e.message}}
-async function wxPoll(){try{const d=await api('/admin/weixin/login/status');$('wxOut').textContent=JSON.stringify(d,null,1);if(d.status==='connected')clearInterval(wxTimer)}catch(e){$('wxOut').textContent=e.message;clearInterval(wxTimer)}}
-async function wxStatus(){try{$('wxOut').textContent=JSON.stringify(await api('/admin/weixin'),null,1)}catch(e){$('wxOut').textContent=e.message}}
-if(getK())loadAccs();
+  clearInterval(wxTimer);wxTimer=setInterval(()=>wxPoll(id),2500)}catch(e){$('wxOut').textContent=e.message}}
+async function wxPoll(id){try{const d=await api('/admin/weixin/'+id+'/login/status');$('wxOut').textContent=d.status;
+  if(d.status==='connected'){clearInterval(wxTimer);$('wxQr').innerHTML='';wxStatus()}}catch(e){$('wxOut').textContent=e.message;clearInterval(wxTimer)}}
+async function wxLogout(id){if(confirm('断开这个账号的微信？')){await api('/admin/weixin/'+id+'/logout',{method:'POST'});wxStatus()}}
+async function wxAllow(id){const v=prompt('额外允许的微信用户 ID（逗号分隔，扫码本人已默认允许）：');if(v===null)return;
+  const cur=(await api('/admin/weixin')).bots.find(b=>b.account_id===id).allow_from||[];
+  await api('/admin/weixin/'+id+'/allow',{method:'POST',json:{users:[...new Set([...cur,...v.split(',').map(x=>x.trim()).filter(Boolean)])]}});wxStatus()}
+async function wxStatus(){try{const d=await api('/admin/weixin');
+  $('wxList').innerHTML='<table><tr><th>muse 账号</th><th>微信</th><th></th></tr>'+d.bots.map(b=>
+   `<tr><td>${esc(b.label)}</td><td>${b.status==='connected'?'已连接 '+esc(b.user_id||''):b.status==='expired'?'已失效，需重扫':'未连接'}</td>
+   <td><button onclick="wxLogin('${b.account_id}')">${b.status==='connected'?'重新扫码':'扫码绑定'}</button>
+   ${b.status==='connected'?`<button onclick="wxAllow('${b.account_id}')">放行他人</button><button onclick="wxLogout('${b.account_id}')">断开</button>`:''}</td></tr>`).join('')+'</table>'}
+  catch(e){$('wxList').textContent=e.message}}
+if(getK()){loadAccs();wxStatus()}
 </script></body></html>

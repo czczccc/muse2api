@@ -22,8 +22,9 @@ router = APIRouter()
 WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
            "/重置：开始新话题（若接入的是 muse 主要聊天，其中的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
-_wx_accounts: dict[str, str] = {}   # 微信用户 -> 固定使用的账号
-_wx_default_acc: str | None = None   # 预热用的账号；新用户优先分到它
+_wx_user_bot: dict[str, WeixinBot] = {}   # 微信用户 -> 接收他消息的 bot（授权弹窗等主动推送用）
+_bots: dict[str, WeixinBot] = {}          # muse 账号 -> 绑定在它上面的微信 bot
+_bots_lock = threading.Lock()
 
 
 _wx_options: dict[str, list[str]] = {}
@@ -42,11 +43,18 @@ def wx_ask_permission(user: str, text: str, buttons: list[str], push=None,
     msg = ("muse.ai 需要你确认：\n" + text.strip()[:500] + "\n\n" + "\n".join(lines)
            + f"\n\n回复数字选择；{int(timeout)} 秒内没回复将自动拒绝。")
     try:
-        (push or weixin.push_text)(user, msg)
+        (push or _wx_push)(user, msg)
         st["event"].wait(timeout)
     finally:
         _wx_prompts.pop(user, None)
     return st["answer"]
+
+
+def _wx_push(user: str, text: str):
+    bot = _wx_user_bot.get(user)
+    if bot is None:
+        raise RuntimeError("找不到该微信用户所属的 bot")
+    bot.push_text(user, text)
 
 
 def wx_answer_prompt(user: str, text: str) -> str | None:
@@ -133,7 +141,7 @@ def wx_turn_replies(turn: list[dict], opts: list[str]) -> list:
     return replies
 
 
-def _wx_chat(user: str, text: str, emit=None) -> list:
+def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
     """微信对话走 muse.ai 的聊天：只发新消息，上下文由 muse 自己记。
     一轮回复的多个气泡、文件、代码块都按顺序转发；取不到分段信息时退回合并文本。"""
     text = wx_resolve_option(text, _wx_options.pop(user, []))
@@ -141,14 +149,15 @@ def _wx_chat(user: str, text: str, emit=None) -> list:
     hist.append(ChatMessage(role="user", content=text))
     del hist[:-12]
     fallback = build_chat_prompt(hist)
-    # 同一微信用户固定用同一个账号：对话会话是按账号记住的，轮换账号就会每条消息新开一个旁聊
-    acc = store.get_account(_wx_accounts.get(user) or "")
-    if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
-        acc = store.pick_account(rotate=True, preferred_id=_wx_default_acc or getattr(engine, "current_acc_id", None))
-        if acc:
-            _wx_accounts[user] = acc["id"]
-    if not acc:
-        raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
+    # 每个 bot 绑定一个 muse 账号：同一微信用户始终用它，对话会话按账号记住
+    if acc_id:
+        acc = store.get_account(acc_id)
+        if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
+            raise RuntimeError("这个微信绑定的 muse 账号不可用（已删除、被停用或 cookie 为空），请在管理页检查")
+    else:
+        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+        if not acc:
+            raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
     opts: list[str] = []
     turn: list[dict] = []
     early: list[dict] = []      # 生成过程中已经先发出去的气泡/附件
@@ -183,16 +192,16 @@ def _wx_chat(user: str, text: str, emit=None) -> list:
     return [("text", "（没有收到回复，请稍后重试）")]
 
 
-def _wx_handle(user: str, text: str, emit=None) -> list:
+def _wx_handle(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
     answered = wx_answer_prompt(user, text)
     if answered is not None:       # 回答授权弹窗不能被同一用户正在跑的任务挡住
         return [("text", answered)]
     with _wx_locks.setdefault(user, threading.Lock()):   # 同一用户的消息按顺序处理
-        return _wx_handle_locked(user, text, emit)
+        return _wx_handle_locked(user, text, emit, acc_id=acc_id)
 
 
-def _wx_handle_locked(user: str, text: str, emit=None) -> list:
+def _wx_handle_locked(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
@@ -201,36 +210,81 @@ def _wx_handle_locked(user: str, text: str, emit=None) -> list:
             return [("text", "请在命令后面写上描述，例如：/画 一只戴宇航头盔的柴犬")]
         if kind == "image":
             res, _ = _run_generation(build_image_prompt(ImageRequest(prompt=prompt)),
-                                     "image", CFG.image_timeout)
+                                     "image", CFG.image_timeout, account_id=acc_id)
         else:
             res, _ = _run_generation(build_video_prompt(VideoRequest(prompt=prompt)),
-                                     "video", CFG.video_timeout)
+                                     "video", CFG.video_timeout, account_id=acc_id)
         path = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
         return [("media", path, "video" if res.get("kind") == "video" else "image")]
     if text.strip() in ("/重置", "/reset", "/new"):
         _wx_history.pop(user, None)
         _wx_options.pop(user, None)
-        _wx_accounts.pop(user, None)
-        engine.forget_chat_binding()
+        engine.forget_chat_binding(acc_id)
         return [("text", "已清空对话上下文。")]
     if text.strip() in ("/帮助", "/help", "/?"):
         return [("text", WX_HELP)]
-    return _wx_chat(user, text, emit)
+    return _wx_chat(user, text, emit, acc_id=acc_id)
 
 
-weixin = WeixinBot(CFG.weixin_file, _wx_handle, allow_env=CFG.weixin_allow_from)
+def _state_path(acc_id: str) -> str:
+    return os.path.join(CFG.data_dir, "weixin_" + re.sub(r"[^\w\-]", "_", acc_id) + ".json")
 
 
-def warm_wx():
-    """服务启动后提前把微信对话用的页面打开，让第一条消息也是快的。"""
-    global _wx_default_acc
+def _make_bot(acc_id: str) -> WeixinBot:
+    def handler(user, text, emit=None):
+        _wx_user_bot[user] = bot
+        return _wx_handle(user, text, emit, acc_id=acc_id)
+
+    bot = WeixinBot(_state_path(acc_id), handler, allow_env=CFG.weixin_allow_from)
+    return bot
+
+
+def get_bot(acc_id: str) -> WeixinBot:
+    if not store.get_account(acc_id):
+        raise HTTPException(404, "账号不存在")
+    with _bots_lock:
+        if acc_id not in _bots:
+            _bots[acc_id] = _make_bot(acc_id)
+        return _bots[acc_id]
+
+
+def _migrate_legacy():
+    """旧版只有一个 weixin.json（单 bot）：归到第一个可用账号名下。"""
+    old = CFG.weixin_file
+    if not os.path.exists(old):
+        return
+    first = next((a for a in store.accounts if a.get("enabled", True)), None) or next(iter(store.accounts), None)
+    if first and not os.path.exists(_state_path(first["id"])):
+        os.replace(old, _state_path(first["id"]))
+        log.info("旧的微信连接已归到账号 %s 名下", first.get("label") or first["id"])
+
+
+def start_bots():
+    """启动所有已扫码的 bot，并预热各自账号的对话页。"""
+    _migrate_legacy()
+    for acc in list(store.accounts):
+        if not os.path.exists(_state_path(acc["id"])):
+            continue
+        bot = get_bot(acc["id"])
+        if bot.state.get("bot_token"):
+            bot.start()
+            threading.Thread(target=warm_wx, args=(acc["id"],), daemon=True,
+                             name="wx-warm-" + acc["id"][:6]).start()
+
+
+def stop_bots():
+    for bot in list(_bots.values()):
+        bot.stop()
+
+
+def warm_wx(acc_id: str):
+    """提前把该账号的微信对话页面打开，让第一条消息也是快的。"""
     try:
-        acc = store.pick_account(rotate=False)
-        if not acc:
+        acc = store.get_account(acc_id)
+        if not acc or not acc.get("cookies"):
             return
-        _wx_default_acc = acc["id"]
         engine.start()
-        engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc["id"])
+        engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("微信对话页面预热失败（不影响使用）: %s", exc)
 
@@ -249,41 +303,53 @@ def _qr_svg(content: str) -> str:
 
 @router.get("/admin/weixin")
 def weixin_status(_=Depends(auth)):
-    return {"enabled": CFG.weixin_enabled, **weixin.info()}
+    """每个 muse 账号一行：有没有绑定微信、连接状态。"""
+    rows = []
+    for a in store.accounts:
+        bot = _bots.get(a["id"])
+        if bot is None and os.path.exists(_state_path(a["id"])):
+            bot = get_bot(a["id"])
+        rows.append({"account_id": a["id"], "label": a.get("label") or a["id"],
+                     **(bot.info() if bot else {"status": "disconnected", "allow_from": [], "login": None})})
+    return {"enabled": CFG.weixin_enabled, "bots": rows}
 
 
-@router.post("/admin/weixin/login")
-async def weixin_login(_=Depends(auth)):
+@router.post("/admin/weixin/{acc_id}/login")
+async def weixin_login(acc_id: str, _=Depends(auth)):
     if not CFG.weixin_enabled:
         raise HTTPException(400, "微信接入已被 MUSE2API_WEIXIN_ENABLED=0 关闭")
+    bot = get_bot(acc_id)
     try:
-        info = await asyncio.to_thread(weixin.start_login)
+        info = await asyncio.to_thread(bot.start_login)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"获取二维码失败: {exc}") from exc
     return {**info, "svg": _qr_svg(info.get("content") or "")}
 
 
-@router.get("/admin/weixin/login/status")
-async def weixin_login_status(_=Depends(auth)):
+@router.get("/admin/weixin/{acc_id}/login/status")
+async def weixin_login_status(acc_id: str, _=Depends(auth)):
+    bot = get_bot(acc_id)
     try:
-        await asyncio.to_thread(weixin.poll_login)
+        await asyncio.to_thread(bot.poll_login)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"查询扫码状态失败: {exc}") from exc
-    return weixin.info()
+    if bot.status == "connected":
+        threading.Thread(target=warm_wx, args=(acc_id,), daemon=True).start()
+    return bot.info()
 
 
-@router.post("/admin/weixin/logout")
-def weixin_logout(_=Depends(auth)):
-    weixin.disconnect()
-    return weixin.info()
+@router.post("/admin/weixin/{acc_id}/logout")
+def weixin_logout(acc_id: str, _=Depends(auth)):
+    bot = get_bot(acc_id)
+    bot.disconnect()
+    return bot.info()
 
 
-@router.post("/admin/weixin/allow")
-def weixin_allow(payload: dict = Body(default={}), _=Depends(auth)):
+@router.post("/admin/weixin/{acc_id}/allow")
+def weixin_allow(acc_id: str, payload: dict = Body(default={}), _=Depends(auth)):
     users = payload.get("users") or []
     if not isinstance(users, list):
         raise HTTPException(400, "users 需为数组")
-    weixin.set_allow([str(u) for u in users])
-    return weixin.info()
-
-
+    bot = get_bot(acc_id)
+    bot.set_allow([str(u) for u in users])
+    return bot.info()
