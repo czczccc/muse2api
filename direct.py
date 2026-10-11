@@ -63,9 +63,12 @@ def _find_media(obj, out=None) -> list[dict]:
                     if isinstance(obj.get(k), str) and obj[k].startswith("http")), None)
         aid = next((obj[k] for k in ("artifact_id", "artifactId", "handle", "file_id")
                     if isinstance(obj.get(k), str)), None)
-        if url or aid:
-            out.append({"url": url, "artifact_id": aid,
-                        "name": obj.get("name") or obj.get("filename") or obj.get("title") or "",
+        path = next((obj[k] for k in ("image_path", "video_path", "file_path", "path")
+                     if isinstance(obj.get(k), str) and "/" in obj[k] and not obj[k].startswith("http")
+                     and re.search(r"\.[A-Za-z0-9]{1,8}$", obj[k])), None)
+        if url or aid or path:
+            out.append({"url": url, "artifact_id": aid, "path": path,
+                        "name": obj.get("name") or obj.get("filename") or (os.path.basename(path) if path else ""),
                         "mime": obj.get("mime_type") or obj.get("mimeType") or obj.get("content_type") or ""})
             return out
         for v in obj.values():
@@ -119,6 +122,8 @@ class DirectClient:
         from curl_cffi import requests as rq
         url = m.get("url")
         try:
+            if m.get("path") and not url:
+                return self._fs_read(m["path"])
             if not url and m.get("artifact_id"):
                 d = self.gw.call_json("artifacts.fetch_url", body={"artifact_id": m["artifact_id"]})
                 url = (d.get("url") if isinstance(d, dict) else d) or None
@@ -134,13 +139,50 @@ class DirectClient:
             log.warning("取附件失败：%s", str(exc)[:160])
         return None, ""
 
+    def _emit_media(self, m: dict, out: list, on_message):
+        data, mime = self._fetch_media(m)
+        mime = mime or m.get("mime") or ""
+        kind = "image" if mime.startswith("image") else "video" if mime.startswith("video") else "file"
+        it = ("media", data, kind, m.get("name") or "") if data else \
+            ("text", "（附件没能取回，请到 muse.ai 页面查看）")
+        out.append(it)
+        on_message(it)
+
+    def _fs_read(self, path: str) -> tuple[bytes | None, str]:
+        """用网关的 fs.read 读 VM 里的文件（生成的图片/文件都在 workspace/ 下）。"""
+        import base64
+        import json as _json
+        raw = self.gw.request("fs.read", body={"path": path}, timeout=60)
+        mime = "image/png" if path.lower().endswith(".png") else \
+            "image/jpeg" if re.search(r"\.jpe?g$", path, re.I) else \
+            "image/webp" if path.lower().endswith(".webp") else \
+            "video/mp4" if path.lower().endswith(".mp4") else ""
+        try:
+            d = _json.loads(raw)
+        except ValueError:
+            return (raw or None), mime
+        if isinstance(d, dict):
+            d = d.get("result", d)
+            for k in ("content_base64", "data_base64", "base64", "content", "data", "bytes"):
+                v = d.get(k) if isinstance(d, dict) else None
+                if isinstance(v, str) and v:
+                    enc = (d.get("encoding") or "").lower()
+                    if "base64" in k or enc == "base64" or not enc:
+                        try:
+                            return base64.b64decode(v), d.get("mime_type") or mime
+                        except Exception:  # noqa: BLE001
+                            return v.encode(), d.get("mime_type") or mime
+                    return v.encode(), d.get("mime_type") or mime
+        log.warning("fs.read 返回无法识别：%s", str(d)[:300])
+        return None, ""
+
     def _check_approvals(self, seen: set, on_prompt):
         try:
             d = self.gw.call_json("egress.approvals")
         except Exception as exc:  # noqa: BLE001
             log.debug("读取授权请求失败: %s", exc)
             return
-        items = d if isinstance(d, list) else (d.get("approvals") or d.get("items") or []) if isinstance(d, dict) else []
+        items = d if isinstance(d, list) else (d.get("pending") or d.get("approvals") or d.get("items") or []) if isinstance(d, dict) else []
         for a in items:
             if not isinstance(a, dict):
                 continue
@@ -150,16 +192,23 @@ class DirectClient:
             seen.add(aid)
             log.info("直连授权请求：%s", str(a)[:400])
             host = a.get("host") or a.get("destination") or a.get("domain") or a.get("target") or ""
-            desc = a.get("description") or a.get("reason") or a.get("summary") or ""
-            txt = (f"允许 Muse 与 {host} 分享信息？\n{desc}").strip()
+            port = a.get("port")
+            what = a.get("display_name") or ""
+            cmd = (a.get("observed_command") or "")[:200]
+            txt = (f"允许 Muse 与 {host}{':' + str(port) if port else ''} 分享信息？"
+                   + (f"\n来源：{what}" if what else "") + (f"\n命令：{cmd}" if cmd else "")).strip()
             idx = on_prompt(txt, APPROVAL_BUTTONS) if on_prompt else None
             decision = APPROVAL_DECISIONS[idx if idx is not None else 2]
-            try:
-                r = self.gw.call_json("egress.approval.decide", path_params={"approval_id": aid},
-                                      body={"decision": decision})
-                log.info("授权已提交 %s：%s", decision, str(r)[:200])
-            except Exception as exc:  # noqa: BLE001
-                log.warning("提交授权失败（%s）：%s", decision, str(exc)[:300])
+            opts = a.get("decision_options") or []
+            if opts and decision not in opts:
+                decision = "deny" if "deny" in opts else opts[-1]
+            for body in ({"decision": decision}, {"decision": decision, "request_id": a.get("request_id")}):
+                try:
+                    r = self.gw.call_json("egress.approval.decide", path_params={"approval_id": aid}, body=body)
+                    log.info("授权已提交 %s：%s", decision, str(r)[:200])
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("提交授权失败（%s）：%s", body, str(exc)[:300])
 
     def turn(self, cookies: dict, text: str, timeout: float, on_message, on_prompt=None) -> list:
         """发一条消息到主要聊天，回复每完成一条就调用 on_message(item)；item 为 ("text", s)
@@ -209,9 +258,23 @@ class DirectClient:
                     continue
                 pending = False
                 for ev in evs:
-                    if ev.get("event_name") != "message.assistant" or (ev.get("seq") or 0) <= baseline:
-                        continue
                     seq = ev.get("seq")
+                    if ev.get("event_name") == "delta.presentation" and (seq or 0) > baseline \
+                            and seq not in delivered:
+                        media = _find_media(_payload(ev))
+                        if not media:
+                            if str(_payload(ev).get("state") or "").lower() not in ("failed", "error", "cancelled"):
+                                pending = True
+                            continue
+                        delivered.add(seq)
+                        log.info("直连：生成内容 %s", str({k: v for k, v in _payload(ev).items()
+                                                        if k in ("kind", "state", "image_path", "id")})[:300])
+                        for m in media:
+                            self._emit_media(m, out, on_message)
+                        last_new = time.time()
+                        continue
+                    if ev.get("event_name") != "message.assistant" or (seq or 0) <= baseline:
+                        continue
                     if is_reply(ev, baseline):
                         if seq in delivered:
                             continue
@@ -224,19 +287,11 @@ class DirectClient:
                         if _has_attachment(ev) or media:
                             log.info("直连回复附件：%s", str({k: v for k, v in _payload(ev).items()
                                                             if k not in ("display_text", "content")})[:800])
-                        for m in media:
-                            data, mime = self._fetch_media(m)
-                            mime = mime or m.get("mime") or ""
-                            kind = "image" if mime.startswith("image") else "video" if mime.startswith("video") else "file"
-                            if data:
-                                items.append(("media", data, kind, m.get("name") or ""))
-                            else:
-                                items.append(("text", "（附件没能取回，请到 muse.ai 页面查看）"))
-                        if not media and _has_attachment(ev):
-                            items.append(("text", "（这条回复带附件，暂时没能识别，请到 muse.ai 页面查看）"))
                         for it in items:
                             out.append(it)
                             on_message(it)
+                        for m in media:
+                            self._emit_media(m, out, on_message)
                         last_new = time.time()
                     elif not (ev.get("reply_to_message_id") or _payload(ev).get("reply_to_message_id")) \
                             and _text(ev) and not _payload(ev).get("status"):

@@ -20,6 +20,7 @@ def ev(seq, text, status="completed", reply_to="", name="message.assistant"):
 
 class FakeGW:
     opened = []
+    reads = []
     approvals = []
     decided = []
     script = []          # 每次 history 调用依次返回的事件列表
@@ -41,6 +42,11 @@ class FakeGW:
         i = min(self.n, len(FakeGW.script) - 1)
         self.n += 1
         return {"chat_events": [ev(10, "旧消息")] + FakeGW.script[i]}
+
+    def request(self, method, body=None, **kw):
+        assert method == "fs.read"
+        FakeGW.reads.append(body["path"])
+        return b'{"content_base64": "UE5HREFUQQ=="}'
 
     def _open(self, method, body=None, **kw):
         FakeGW.opened.append((method, body))
@@ -101,7 +107,8 @@ def test_wx_chat_direct_emits_early():
 
 def test_approval_is_forwarded_and_decided():
     FakeGW.script = [[ev(11, "好了")]]
-    FakeGW.approvals = [{"id": "ap1", "status": "pending", "host": "1.1.1.1"}]
+    FakeGW.approvals = {"pending": [{"approval_id": "ap1", "host": "1.1.1.1", "port": 22,
+                                     "decision_options": ["allow_once", "allow_always", "deny"]}]}
     FakeGW.decided = []
     asked = []
     c = direct.DirectClient("acc3")
@@ -113,4 +120,17 @@ def test_approval_is_forwarded_and_decided():
 
 def test_find_media():
     p = {"display_text": "图", "attachments": [{"url": "https://x/y.png", "mime_type": "image/png", "name": "y.png"}]}
-    assert direct._find_media(p) == [{"url": "https://x/y.png", "artifact_id": None, "name": "y.png", "mime": "image/png"}]
+    assert direct._find_media(p) == [{"url": "https://x/y.png", "artifact_id": None, "path": None, "name": "y.png", "mime": "image/png"}]
+
+
+def test_presentation_image_is_read_via_fs():
+    pres = {"seq": 12, "event_name": "delta.presentation",
+            "payload": {"kind": "image", "state": "ready", "display_text": "咖啡馆",
+                        "image_path": "workspace/user/media_library/image/b8/abc.png"}}
+    FakeGW.script = [[ev(11, "画好了"), pres]]
+    FakeGW.approvals, FakeGW.reads = [], []
+    got = []
+    direct.DirectClient("acc4").turn({"a": "b"}, "画", 5, got.append)
+    assert got[0] == ("text", "画好了")
+    assert got[1] == ("media", b"PNGDATA", "image", "abc.png"), got
+    assert FakeGW.reads == ["workspace/user/media_library/image/b8/abc.png"]
