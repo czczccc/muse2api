@@ -1551,6 +1551,10 @@ class MuseEngine:
                     deadline += waited
                     first_token_deadline += waited
             cnt, cur, has_stop = self._poll_chat()
+            if has_stop:
+                # 助手还在干活（执行命令、联网等）没有吐字：只要「停止」按钮还在就继续等，
+                # 总时限仍受 timeout 约束，不再 40 秒就判定首字超时
+                first_token_deadline = deadline
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
                     try:
