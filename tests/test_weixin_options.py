@@ -26,7 +26,7 @@ def test_chat_uses_main_chat_and_options():
     seen = {}
 
     def fake_stream(cookies, prompt, exp, timeout, account_id=None, main_chat=False,
-                    fallback_prompt=None, on_options=None):
+                    fallback_prompt=None, on_options=None, on_prompt=None):
         seen.update(prompt=prompt, main=main_chat, fb=fallback_prompt)
         yield TEXT
         on_options(OPTS)
@@ -40,7 +40,48 @@ def test_chat_uses_main_chat_and_options():
     assert seen["prompt"] == OPTS[1]
 
 
+def test_permission_prompt_roundtrip():
+    import threading
+    import time
+    pushed = []
+    res = {}
+
+    def ask():
+        res["idx"] = app.wx_ask_permission("u", "允许 Muse 删除 45 个聊天？", ["允许", "拒绝"],
+                                           push=lambda u, m: pushed.append(m), timeout=5)
+    th = threading.Thread(target=ask)
+    th.start()
+    for _ in range(50):
+        if pushed:
+            break
+        time.sleep(0.05)
+    assert "1. 允许" in pushed[0] and "2. 拒绝" in pushed[0]
+    assert "请回复" in app.wx_answer_prompt("u", "abc")      # 听不懂不会解除等待
+    assert app.wx_answer_prompt("u", "1").startswith("已选择")
+    th.join(3)
+    assert res["idx"] == 0
+    assert app.wx_answer_prompt("u", "1") is None            # 已结束，不再拦截普通消息
+    # 超时返回 None
+    assert app.wx_ask_permission("u", "x", ["允许", "拒绝"], push=lambda u, m: None, timeout=0.1) is None
+
+
+def test_engine_dialog_handling():
+    import engine as E
+    eng = object.__new__(E.MuseEngine)
+    clicked = []
+    eng._poll_dialog = lambda: {"text": "允许吗", "buttons": ["允许", "拒绝"]}
+    eng._click_dialog_button = lambda i: clicked.append(i) or True
+    eng.handle_dialog(lambda t, b: 0)
+    eng.handle_dialog(lambda t, b: None)          # 未答复 → 点拒绝
+    eng.handle_dialog(lambda t, b: 9)             # 非法下标 → 点拒绝
+    eng._poll_dialog = lambda: {"text": "?", "buttons": ["好的", "继续"]}
+    eng.handle_dialog(lambda t, b: None)          # 没有拒绝类按钮 → 点最后一个
+    assert clicked == [0, 1, 1, 1], clicked
+
+
 if __name__ == "__main__":
     test_format_and_resolve()
     test_chat_uses_main_chat_and_options()
+    test_permission_prompt_roundtrip()
+    test_engine_dialog_handling()
     print("weixin options tests OK")

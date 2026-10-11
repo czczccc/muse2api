@@ -985,6 +985,58 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return []
 
+    # 页面上的授权/确认弹窗（role=dialog / alertdialog），返回正文和按钮文字
+    _DIALOG_JS = (
+        "(function(){"
+        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'))"
+        ".filter(function(d){var r=d.getBoundingClientRect();return r.width>0&&r.height>0;});"
+        "var d=ds[ds.length-1];if(!d)return '';"
+        "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]'))"
+        ".map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');})"
+        ".filter(function(t){return t&&t.length<80;});"
+        "if(!bs.length)return '';"
+        "var txt=(d.innerText||'').trim();"
+        "return JSON.stringify({text:txt.slice(0,600),buttons:bs});})()"
+    )
+    _DENY_RE = re.compile(r"拒绝|不允许|不同意|取消|^否$|\bdeny|\breject|\bdecline|\bcancel|^no$", re.I)
+
+    def _poll_dialog(self) -> dict | None:
+        try:
+            raw = self.page.js(self._DIALOG_JS)
+            return json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _click_dialog_button(self, idx: int) -> bool:
+        try:
+            return bool(self.page.js(
+                "(function(i){var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'));"
+                "var d=ds[ds.length-1];if(!d)return false;"
+                "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
+                "var t=(b.innerText||b.getAttribute('aria-label')||'').trim();return t&&t.length<80;});"
+                "if(!bs[i])return false;bs[i].click();return true;})(%d)" % int(idx)))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def handle_dialog(self, on_prompt) -> float:
+        """若页面弹出授权/确认窗，交给 on_prompt(text, buttons) 决定点哪个按钮（返回下标，
+        None=未答复）。未答复时点「拒绝」类按钮，找不到就点最后一个。返回等待耗时（秒）。"""
+        d = self._poll_dialog()
+        if not d:
+            return 0.0
+        t0 = time.time()
+        buttons = d["buttons"]
+        try:
+            idx = on_prompt(d["text"], buttons)
+        except Exception:  # noqa: BLE001
+            idx = None
+        if idx is None or not 0 <= idx < len(buttons):
+            denies = [i for i, b in enumerate(buttons) if self._DENY_RE.search(b)]
+            idx = denies[0] if denies else len(buttons) - 1
+        self._click_dialog_button(idx)
+        time.sleep(0.3)
+        return time.time() - t0
+
     def _report_options(self, on_options):
         if on_options is None:
             return
@@ -1006,7 +1058,8 @@ class MuseEngine:
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, main_chat: bool = False,
-                    fallback_prompt: str | None = None, on_options=None):
+                    fallback_prompt: str | None = None, on_options=None,
+                    on_prompt=None):
         """发一条消息，流式 yield 增量文本。
 
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
@@ -1029,12 +1082,19 @@ class MuseEngine:
         first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable = "", None, 0
         got_first = False
+        last_dlg = [0.0]
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
+            if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
+                last_dlg[0] = time.time()
+                waited = self.handle_dialog(on_prompt)
+                if waited:
+                    deadline += waited
+                    first_token_deadline += waited
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
@@ -1062,6 +1122,9 @@ class MuseEngine:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
+            if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
+                last_dlg[0] = time.time()
+                deadline += self.handle_dialog(on_prompt)
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue

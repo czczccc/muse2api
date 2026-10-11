@@ -310,7 +310,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      main_chat: bool = False, fallback_prompt: str | None = None,
-                     on_options=None):
+                     on_options=None, on_prompt=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -364,7 +364,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
                             main_chat=main_chat, fallback_prompt=fallback_prompt,
-                            on_options=on_options
+                            on_options=on_options, on_prompt=on_prompt
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -2433,6 +2433,46 @@ _wx_history: dict[str, list[ChatMessage]] = {}
 
 
 _wx_options: dict[str, list[str]] = {}
+_wx_prompts: dict[str, dict] = {}   # 等待用户答复的授权弹窗：{event, buttons, answer}
+WX_PROMPT_TIMEOUT = 180
+
+
+def wx_ask_permission(user: str, text: str, buttons: list[str], push=None,
+                      timeout: float = WX_PROMPT_TIMEOUT) -> int | None:
+    """muse.ai 弹出授权/确认窗：把正文和编号按钮发到微信，阻塞等用户回复，返回按钮下标。
+    超时返回 None（引擎会点「拒绝」类按钮）。"""
+    st = {"event": threading.Event(), "buttons": buttons, "answer": None}
+    _wx_prompts[user] = st
+    lines = [f"{i}. {b}" for i, b in enumerate(buttons, 1)]
+    msg = ("muse.ai 需要你确认：\n" + text.strip()[:500] + "\n\n" + "\n".join(lines)
+           + f"\n\n回复数字选择；{int(timeout)} 秒内没回复将自动拒绝。")
+    try:
+        (push or weixin.push_text)(user, msg)
+        st["event"].wait(timeout)
+    finally:
+        _wx_prompts.pop(user, None)
+    return st["answer"]
+
+
+def wx_answer_prompt(user: str, text: str) -> str | None:
+    """若该用户有待答复的弹窗，用这条消息作答并返回提示语；没有则返回 None。"""
+    st = _wx_prompts.get(user)
+    if not st:
+        return None
+    t = text.strip()
+    idx = None
+    if t.isdigit() and 1 <= int(t) <= len(st["buttons"]):
+        idx = int(t) - 1
+    else:
+        for i, b in enumerate(st["buttons"]):
+            if t and (t == b or t in b):
+                idx = i
+                break
+    if idx is None:
+        return f"请回复 1 到 {len(st['buttons'])} 之间的数字来选择。"
+    st["answer"] = idx
+    st["event"].set()
+    return f"已选择：{st['buttons'][idx]}"
 
 
 def wx_format_options(text: str, opts: list[str]) -> str:
@@ -2467,7 +2507,8 @@ def _wx_chat(user: str, text: str) -> str:
     out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
                                    CFG.chat_timeout, account_id=acc["id"],
                                    main_chat=True, fallback_prompt=fallback,
-                                   on_options=opts.extend)).strip()
+                                   on_options=opts.extend,
+                                   on_prompt=lambda t, b: wx_ask_permission(user, t, b))).strip()
     if out:
         hist.append(ChatMessage(role="assistant", content=out))
         del hist[:-12]
@@ -2479,6 +2520,9 @@ def _wx_chat(user: str, text: str) -> str:
 
 def _wx_handle(user: str, text: str) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
+    answered = wx_answer_prompt(user, text)
+    if answered is not None:
+        return [("text", answered)]
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"

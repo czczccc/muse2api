@@ -185,6 +185,7 @@ class WeixinBot:
         self._thread: threading.Thread | None = None
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wx")
         self._seen: list = []
+        self._ctx: dict[str, str] = {}   # 每个用户最近一条入站消息的 context_token
         if self.state.get("bot_token"):
             self.status = "connected"
 
@@ -339,6 +340,7 @@ class WeixinBot:
         if not self.allowed(user):
             log.info("微信消息被白名单拦截: %s", user)
             return
+        self._ctx[user] = ctx
         self.pool.submit(self._handle, user, text, ctx)
 
     def _handle(self, user: str, text: str, ctx: str):
@@ -358,6 +360,10 @@ class WeixinBot:
             except Exception as exc:  # noqa: BLE001
                 log.warning("微信发送失败: %s", exc)
                 self.last_error = str(exc)[:200]
+
+    def push_text(self, user: str, text: str):
+        """在处理消息的过程中主动给用户发文字（如授权请求），沿用最近的 context_token。"""
+        self._client().send_text(user, text, self._ctx.get(user, ""))
 
     # ---- 状态 ----
     def info(self) -> dict:
