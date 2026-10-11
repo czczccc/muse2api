@@ -142,7 +142,7 @@ def wx_turn_replies(turn: list[dict], opts: list[str]) -> list:
     return replies
 
 
-def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
+def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None, images=None) -> list:
     """微信对话走 muse.ai 的聊天：只发新消息，上下文由 muse 自己记。
     一轮回复的多个气泡、文件、代码块都按顺序转发；取不到分段信息时退回合并文本。"""
     text = wx_resolve_option(text, _wx_options.pop(user, []))
@@ -161,7 +161,7 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
             raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
     if direct.enabled():
         # 浏览器对话方案已停用：只走直连，失败直接报错
-        return _wx_chat_direct(user, text, emit, acc, hist)
+        return _wx_chat_direct(user, text, emit, acc, hist, images)
     opts: list[str] = []
     turn: list[dict] = []
     early: list[dict] = []      # 生成过程中已经先发出去的气泡/附件
@@ -196,7 +196,7 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
     return [("text", "（没有收到回复，请稍后重试）")]
 
 
-def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
+def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list, images=None) -> list:
     """直连网关：每条助手回复（文字/图片/文件）完成就先发给微信，不开浏览器。"""
     early: list = []
     rest: list = []
@@ -237,7 +237,7 @@ def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
             rest.append(r)
 
     direct.get_client(acc["id"]).turn(acc["cookies"], text, CFG.chat_timeout, on_message,
-                                      on_prompt=lambda t, b: wx_ask_permission(user, t, b))
+                                      on_prompt=lambda t, b: wx_ask_permission(user, t, b), images=images)
     texts = [r[1] for r in early + rest if r[0] == "text"]
     if texts:
         hist.append(ChatMessage(role="assistant", content="\n\n".join(texts)))
@@ -247,16 +247,20 @@ def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
     return [] if early else [("text", "（没有收到回复，请稍后重试）")]
 
 
-def _wx_handle(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
+def _wx_handle(user: str, text: str, emit=None, acc_id: str | None = None, images=None) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
-    answered = wx_answer_prompt(user, text)
+    answered = wx_answer_prompt(user, text) if not images else None
     if answered is not None:       # 回答授权弹窗不能被同一用户正在跑的任务挡住
         return [("text", answered)]
     with _wx_locks.setdefault(user, threading.Lock()):   # 同一用户的消息按顺序处理
+        if images:
+            return _wx_handle_locked(user, text, emit, acc_id=acc_id, images=images)
         return _wx_handle_locked(user, text, emit, acc_id=acc_id)
 
 
-def _wx_handle_locked(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
+def _wx_handle_locked(user: str, text: str, emit=None, acc_id: str | None = None, images=None) -> list:
+    if images:
+        return _wx_chat(user, text, emit, acc_id=acc_id, images=images)
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
@@ -286,9 +290,9 @@ def _state_path(acc_id: str) -> str:
 
 
 def _make_bot(acc_id: str) -> WeixinBot:
-    def handler(user, text, emit=None):
+    def handler(user, text, emit=None, images=None):
         _wx_user_bot[user] = bot
-        return _wx_handle(user, text, emit, acc_id=acc_id)
+        return _wx_handle(user, text, emit, acc_id=acc_id, images=images)
 
     bot = WeixinBot(_state_path(acc_id), handler, allow_env=CFG.weixin_allow_from)
     return bot

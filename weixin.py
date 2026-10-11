@@ -49,6 +49,38 @@ def aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
     return enc.update(padded) + enc.finalize()
 
 
+def aes_ecb_decrypt(data: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    padded = dec.update(data) + dec.finalize()
+    try:
+        unp = padding.PKCS7(128).unpadder()
+        return unp.update(padded) + unp.finalize()
+    except ValueError:
+        return padded
+
+
+def _parse_aes_key(item: dict) -> bytes | None:
+    """入站媒体的 AES key：image_item.aeskey 是 hex；media.aes_key 是 base64（内容为 16 字节原始 key 或 32 位 hex）。"""
+    hx = item.get("aeskey")
+    if isinstance(hx, str) and len(hx) == 32:
+        try:
+            return bytes.fromhex(hx)
+        except ValueError:
+            pass
+    b64 = (item.get("media") or {}).get("aes_key")
+    if b64:
+        raw = base64.b64decode(b64)
+        if len(raw) == 16:
+            return raw
+        try:
+            return bytes.fromhex(raw.decode())
+        except ValueError:
+            return None
+    return None
+
+
 def padded_size(n: int) -> int:
     return (n // 16 + 1) * 16
 
@@ -171,6 +203,17 @@ class ILinkClient:
     def send_typing(self, to_user: str, ticket: str, typing: bool = True):
         self._post("/ilink/bot/sendtyping", {"ilink_user_id": to_user, "typing_ticket": ticket,
                                              "status": 1 if typing else 2})
+
+    def download_media(self, item: dict) -> bytes | None:
+        """下载并解密入站图片/文件（image_item / file_item）。"""
+        media = item.get("media") or {}
+        param = media.get("encrypt_query_param")
+        key = _parse_aes_key(item)
+        if not param or not key:
+            return None
+        r = self.http.get(f"{self.cdn}/download?encrypted_query_param={quote(param)}", timeout=60)
+        r.raise_for_status()
+        return aes_ecb_decrypt(r.content, key)
 
     def upload_media(self, data: bytes, kind: str, to_user: str) -> dict:
         aeskey = secrets.token_bytes(16)
@@ -395,7 +438,8 @@ class WeixinBot:
         ctx = m.get("context_token", "")
         text = "".join((it.get("text_item") or {}).get("text", "")
                        for it in m.get("item_list") or [] if it.get("type") == 1).strip()
-        if not user or not text:
+        imgs = [it.get("image_item") or {} for it in m.get("item_list") or [] if it.get("type") == 2]
+        if not user or not (text or imgs):
             return
         if not self.allowed(user):
             log.info("微信消息被白名单拦截: %s", user)
@@ -404,7 +448,7 @@ class WeixinBot:
         if ctx and self.state.setdefault("ctx", {}).get(user) != ctx:
             self.state["ctx"][user] = ctx
             self._save()
-        self.pool.submit(self._handle, user, text, ctx)
+        self.pool.submit(self._handle, user, text, ctx, imgs)
 
     def _typing_start(self, client, user: str, ctx: str):
         """处理期间持续给对方显示「正在输入」，返回停止用的 Event；失败一律忽略，不影响回复。"""
@@ -438,8 +482,19 @@ class WeixinBot:
                 client.send_media(user, f.read(), r[2], ctx, name=os.path.basename(r[1]))
             log.info("微信已发送%s：%s", r[2], os.path.basename(r[1]))
 
-    def _handle(self, user: str, text: str, ctx: str):
+    def _handle(self, user: str, text: str, ctx: str, imgs: list | None = None):
         client = self._client()
+        images = []
+        for it in imgs or []:
+            try:
+                data = client.download_media(it)
+                if data:
+                    images.append(data)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("下载微信图片失败: %s", exc)
+        if imgs and not images and not text:
+            self._send_reply(client, user, ctx, ("text", "图片没能下载下来，请重发一次。"))
+            return
         typing = self._typing_start(client, user, ctx)
         sent = [0]      # 生成过程中已经先发出去的条数，计入每条入站消息最多回 10 条的预算
 
@@ -460,7 +515,10 @@ class WeixinBot:
             return True
 
         try:
-            if "emit" in inspect.signature(self.handler).parameters:
+            params = inspect.signature(self.handler).parameters
+            if "images" in params:
+                replies = self.handler(user, text, emit=emit, images=images)
+            elif "emit" in params:
                 replies = self.handler(user, text, emit=emit)
             else:
                 replies = self.handler(user, text)

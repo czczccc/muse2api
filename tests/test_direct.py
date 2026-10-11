@@ -29,7 +29,16 @@ class FakeGW:
         self.cookie = cookie
         self.n = 0
 
+    writes = []
+
     def call_json(self, method, body=None, **kw):
+        if method == "fs.mkdir":
+            return {}
+        if method == "fs.write":
+            if "offset" not in body:
+                raise RuntimeError("gateway status=422 missing field `offset` at line 1")
+            FakeGW.writes.append(body)
+            return {"ok": True}
         if method == "fs.stat":
             return {"size": 7}
         if method == "egress.approvals":
@@ -152,3 +161,14 @@ def test_presentation_single_file():
          "path": "sandbox://workspace/your_files/hello.py", "variants": {}}}}
     m = direct._presentation_media(p)
     assert m[0]["path"] == "workspace/your_files/hello.py" and m[0]["name"] == "hello.py"
+
+
+def test_inbound_image_is_uploaded_and_attached():
+    FakeGW.script = [[ev(11, "看到了，是只猫")]]
+    FakeGW.opened, FakeGW.writes, FakeGW.approvals = [], [], []
+    got = []
+    direct.DirectClient("acc5").turn({"a": "b"}, "这是啥", 5, got.append, images=[b"\xff\xd8\xffJPEGDATA"])
+    assert FakeGW.writes[0]["offset"] == 0 and FakeGW.writes[0]["path"].endswith(".jpg")
+    items = FakeGW.opened[-1][1]["items"]
+    assert items[0] == {"type": "text", "text": "这是啥"} and items[1]["type"] == "image"
+    assert items[1]["mime_type"] == "image/jpeg" and got == [("text", "看到了，是只猫")]

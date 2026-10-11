@@ -208,3 +208,11 @@ def test_emit_sends_early_and_respects_budget():
     assert texts[0] == "第一段" and texts[-1] == "最后", texts
     assert flags[0] is True and flags[-1] is False, flags
     assert len(texts) <= W.MAX_REPLIES, texts
+
+
+def test_aes_roundtrip_and_key_parse():
+    key = bytes(range(16))
+    assert W.aes_ecb_decrypt(W.aes_ecb_encrypt(b"hello", key), key) == b"hello"
+    assert W._parse_aes_key({"aeskey": key.hex()}) == key
+    assert W._parse_aes_key({"media": {"aes_key": base64.b64encode(key.hex().encode()).decode()}}) == key
+    assert W._parse_aes_key({"media": {"aes_key": base64.b64encode(key).decode()}}) == key

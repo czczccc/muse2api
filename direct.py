@@ -258,7 +258,42 @@ class DirectClient:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("提交授权失败（%s）：%s", body, str(exc)[:300])
 
-    def turn(self, cookies: dict, text: str, timeout: float, on_message, on_prompt=None) -> list:
+    def _call_adaptive(self, method: str, body: dict, fill: dict, tries: int = 6):
+        """接口字段没有文档：按 422 报的 missing field 逐个补上已知取值再试。"""
+        for _ in range(tries):
+            try:
+                return self.gw.call_json(method, body=body)
+            except Exception as exc:  # noqa: BLE001
+                m = re.search(r"missing field `(\w+)`", str(exc))
+                if not m or m.group(1) not in fill or m.group(1) in body:
+                    raise
+                body[m.group(1)] = fill[m.group(1)]
+        raise RuntimeError(f"{method} 字段补不全：{sorted(body)}")
+
+    def upload_image(self, data: bytes) -> dict:
+        """把用户发来的图片写进 VM 的 media_library，返回聊天附件描述。"""
+        import base64
+        import hashlib as _h
+        ext, mime = (".jpg", "image/jpeg") if data[:3] == b"\xff\xd8\xff" else \
+            (".webp", "image/webp") if data[8:12] == b"WEBP" else \
+            (".gif", "image/gif") if data[:4] == b"GIF8" else (".png", "image/png")
+        sha = _h.sha256(data).hexdigest()
+        path = f"workspace/user/media_library/image/{sha[:2]}/{sha}{ext}"
+        b64 = base64.b64encode(data).decode()
+        fill = {"data_base64": b64, "content_base64": b64, "offset": 0, "len": len(data),
+                "encoding": "base64", "create_dirs": True, "mkdirs": True, "overwrite": True,
+                "truncate": True, "append": False}
+        try:
+            self.gw.call_json("fs.mkdir", body={"path": os.path.dirname(path), "recursive": True})
+        except Exception as exc:  # noqa: BLE001
+            log.debug("fs.mkdir: %s", exc)
+        r = self._call_adaptive("fs.write", {"path": path, "data_base64": b64}, fill)
+        log.info("直连：图片已上传 %s（%d 字节）：%s", path[-30:], len(data), str(r)[:200])
+        return {"path": path, "mime_type": mime, "filename": "image" + ext,
+                "bytes_len": len(data), "sha256": sha}
+
+    def turn(self, cookies: dict, text: str, timeout: float, on_message, on_prompt=None,
+             images=None) -> list:
         """发一条消息到主要聊天，回复每完成一条就调用 on_message(item)；item 为 ("text", s)
         或 ("media", bytes, kind, name)。返回全部 item。"""
         with self.lock:
@@ -267,7 +302,13 @@ class DirectClient:
                 self._ensure(cookies)
                 evs = self._history(1)
                 baseline = max((e.get("seq", 0) for e in evs), default=0)
-                self.gw._open("chat.stream", body={"items": [{"type": "text", "text": text}],
+                items = [{"type": "text", "text": text}] if text else []
+                for data in images or []:
+                    att = self.upload_image(data)
+                    items.append({"type": "image", **att})
+                if not items:
+                    raise RuntimeError("空消息")
+                self.gw._open("chat.stream", body={"items": items,
                                                    "node_id": self.node_id, "capabilities": {}})
             except Exception as exc:  # noqa: BLE001
                 self.close()
@@ -279,7 +320,7 @@ class DirectClient:
             last_new = None
             first_logged = False
             approvals: set = set()
-            want_media = bool(NEEDS_BROWSER.search(text))   # 要图/视频/文件：附件可能比文字晚很多才出现
+            want_media = bool(NEEDS_BROWSER.search(text or ""))   # 要图/视频/文件：附件可能比文字晚很多才出现
             got_media = False
             logged: set = set()
             last_appr = 0.0
