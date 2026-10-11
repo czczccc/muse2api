@@ -93,7 +93,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if stop_event.is_set():
                             return
                         engine.start()
-                        for chunk in engine.chat_stream(
+                        stream = engine.chat_stream_warm if main_chat else engine.chat_stream
+                        for chunk in stream(
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
                             main_chat=main_chat, fallback_prompt=fallback_prompt,
@@ -128,7 +129,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         finally:
             if leased_id:
                 ACCOUNT_POOL.release(leased_id)
-            engine.close_current_page()
+            if not main_chat:        # 主要聊天的页面由常驻线程持有，保持打开以便下一条消息秒回
+                engine.close_current_page()
             q.put(("done", None))
 
     threading.Thread(target=worker, daemon=True).start()

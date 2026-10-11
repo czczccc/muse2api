@@ -56,9 +56,41 @@ def test_new_turn_items_after_last_user_bubble():
     assert got == ["新回复", "blob:new"], got
 
 
+def test_warm_runner_keeps_one_thread_and_closes_on_error():
+    import threading
+    import time
+    seen, closed = [], []
+
+    class FakeEngine:
+        def chat_stream(self, cookies, prompt, expires, timeout, account_id=None, **kw):
+            seen.append(threading.current_thread().name)
+            if prompt == "boom":
+                raise RuntimeError("x")
+            yield "a"
+            yield "b"
+
+        def _close_page(self):
+            closed.append(threading.current_thread().name)
+
+    r = engine_mod._ChatRunner(FakeEngine(), idle=0.2)
+    assert list(r.run({}, "hi", None, 5, account_id="a")) == ["a", "b"]
+    assert list(r.run({}, "hi", None, 5, account_id="a")) == ["a", "b"]
+    assert len(set(seen)) == 1 and seen[0] == "muse-chat-runner", "两条消息必须在同一个常驻线程里，页面才能复用"
+    assert closed == [], "正常结束不能关页面"
+    try:
+        list(r.run({}, "boom", None, 5, account_id="a"))
+        raise AssertionError("应抛出异常")
+    except RuntimeError:
+        pass
+    assert len(closed) == 1, "出错后应关掉可能已坏的页面"
+    time.sleep(0.5)
+    assert len(closed) >= 2, "空闲超时后应释放页面"
+
+
 if __name__ == "__main__":
     test_close_page_keeps_chat_binding()
     test_turn_media_is_forwarded()
     test_new_turn_items_ignores_history()
     test_new_turn_items_after_last_user_bubble()
+    test_warm_runner_keeps_one_thread_and_closes_on_error()
     print("PASS")

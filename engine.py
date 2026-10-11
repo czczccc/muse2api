@@ -14,6 +14,7 @@ import urllib.request
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -40,6 +41,49 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+WARM_IDLE_SECONDS = 240   # 常驻页面空闲多久后关闭（太久不用连接可能已失效）
+
+
+class _ChatRunner:
+    """某账号的常驻对话线程：页面是按线程隔离的，对话固定在同一个线程里跑，
+    页面就能在两条消息之间保持打开，省掉每次开页、注入 cookie、加载会话的几秒到几十秒。"""
+
+    def __init__(self, engine, idle: float = WARM_IDLE_SECONDS):
+        self.engine = engine
+        self.idle = idle
+        self.jobs: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="muse-chat-runner")
+        self.thread.start()
+
+    def _loop(self):
+        while True:
+            try:
+                out, args, kwargs = self.jobs.get(timeout=self.idle)
+            except queue.Empty:
+                self.engine._close_page()      # 空闲太久，释放页面；下次请求再开
+                continue
+            try:
+                for chunk in self.engine.chat_stream(*args, **kwargs):
+                    out.put(("data", chunk))
+            except BaseException as exc:  # noqa: BLE001
+                out.put(("error", exc))
+                self.engine._close_page()      # 出错后别留着可能已坏的页面
+            finally:
+                out.put(("done", None))
+
+    def run(self, *args, **kwargs):
+        out: queue.Queue = queue.Queue()
+        self.jobs.put((out, args, kwargs))
+        while True:
+            kind, val = out.get()
+            if kind == "data":
+                yield val
+            elif kind == "error":
+                raise val
+            else:
+                return
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -48,6 +92,8 @@ class MuseEngine:
         self._local = threading.local()
         self._start_lock = threading.Lock()
         self._chat_urls: dict = {}
+        self._runners: dict[str, _ChatRunner] = {}
+        self._runners_lock = threading.Lock()
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
         self._last_http_renew: dict[str, float] = {}
@@ -1497,6 +1543,16 @@ class MuseEngine:
                     return
 
         raise MuseGenerationError("等待助手回复超时")
+
+    def chat_stream_warm(self, cookies: dict, prompt: str, expires: dict | None = None,
+                         timeout: int | None = None, account_id: str | None = None, **kwargs):
+        """同 chat_stream，但在该账号的常驻线程里执行，页面在请求之间保持打开。"""
+        key = account_id or "_"
+        with self._runners_lock:
+            runner = self._runners.get(key)
+            if runner is None:
+                runner = self._runners[key] = _ChatRunner(self)
+        return runner.run(cookies, prompt, expires, timeout, account_id=account_id, **kwargs)
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:
