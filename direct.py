@@ -59,8 +59,9 @@ def _presentation_media(p: dict) -> list[dict]:
     """delta.presentation 里的图片：data.images[]，带 sandbox:// 路径和 variants.original 原图链接。"""
     out = []
     data = p.get("data") if isinstance(p.get("data"), dict) else {}
-    for key in ("images", "videos", "files"):
-        for im in data.get(key) or []:
+    for key in ("images", "videos", "files", "image", "video", "file"):
+        vals = data.get(key)
+        for im in (vals if isinstance(vals, list) else [vals] if isinstance(vals, dict) else []):
             if not isinstance(im, dict) or im.get("missing"):
                 continue
             path = (im.get("path") or "").replace("sandbox://", "")
@@ -180,6 +181,7 @@ class DirectClient:
         fs.read 必须带 offset；返回格式按 JSON(base64) 或原始字节两种情况处理。"""
         import base64
         import json as _json
+        path = path.replace("sandbox://", "")
         mime = "image/png" if path.lower().endswith(".png") else \
             "image/jpeg" if re.search(r"\.jpe?g$", path, re.I) else \
             "image/webp" if path.lower().endswith(".webp") else \

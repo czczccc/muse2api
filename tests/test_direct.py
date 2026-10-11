@@ -145,3 +145,10 @@ def test_presentation_media_uses_data_images():
     m = direct._presentation_media(p)
     assert m[0]["path"] == "workspace/imagine_media/x.webp" and m[0]["alt_url"].endswith("x.webp")
     assert m[0]["mime"] == "image/webp"
+
+
+def test_presentation_single_file():
+    p = {"kind": "file", "data": {"file": {"mime": "application/octet-stream", "missing": False,
+         "path": "sandbox://workspace/your_files/hello.py", "variants": {}}}}
+    m = direct._presentation_media(p)
+    assert m[0]["path"] == "workspace/your_files/hello.py" and m[0]["name"] == "hello.py"
