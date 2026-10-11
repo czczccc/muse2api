@@ -310,7 +310,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      main_chat: bool = False, fallback_prompt: str | None = None,
-                     on_options=None, on_prompt=None):
+                     on_options=None, on_prompt=None, on_turn=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -364,7 +364,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
                             main_chat=main_chat, fallback_prompt=fallback_prompt,
-                            on_options=on_options, on_prompt=on_prompt
+                            on_options=on_options, on_prompt=on_prompt,
+                            on_turn=on_turn
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -2493,9 +2494,42 @@ def wx_resolve_option(text: str, opts: list[str]) -> str:
     return text
 
 
-def _wx_chat(user: str, text: str) -> str:
-    """微信对话走 muse.ai 的「主要聊天」：只发新消息，上下文由 muse 自己记。
-    进不去主要聊天时，引擎会回退为新会话并改发带历史的 fallback_prompt。"""
+def _wx_safe_name(name: str) -> str:
+    name = os.path.basename(name or "").strip().replace("\\", "_") or "file"
+    return re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", name)[:80] or "file"
+
+
+def wx_turn_replies(turn: list[dict], opts: list[str]) -> list:
+    """把一轮回复里的多个气泡/文件按顺序转成微信消息；文件先落盘，取不回来就给文字说明。"""
+    replies: list = []
+    for it in turn:
+        if it.get("k") == "t":
+            replies.append(("text", it["v"]))
+        elif it.get("k") == "f":
+            name = _wx_safe_name(it.get("name", ""))
+            data = it.get("data")
+            if data:
+                d = os.path.join(CFG.download_dir, "wx")
+                os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, f"{uuid.uuid4().hex[:8]}_{name}")
+                with open(path, "wb") as f:
+                    f.write(data)
+                replies.append(("media", path, "file"))
+            else:
+                replies.append(("text", f"（文件 {name} 没能取回，请到 muse.ai 页面下载）"))
+    if opts:
+        for k in range(len(replies) - 1, -1, -1):
+            if replies[k][0] == "text":
+                replies[k] = ("text", wx_format_options(replies[k][1], opts))
+                break
+        else:
+            replies.append(("text", wx_format_options("", opts)))
+    return replies
+
+
+def _wx_chat(user: str, text: str) -> list:
+    """微信对话走 muse.ai 的聊天：只发新消息，上下文由 muse 自己记。
+    一轮回复的多个气泡、文件、代码块都按顺序转发；取不到分段信息时退回合并文本。"""
     text = wx_resolve_option(text, _wx_options.pop(user, []))
     hist = _wx_history.setdefault(user, [])
     hist.append(ChatMessage(role="user", content=text))
@@ -2505,18 +2539,24 @@ def _wx_chat(user: str, text: str) -> str:
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
     opts: list[str] = []
+    turn: list[dict] = []
     out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
                                    CFG.chat_timeout, account_id=acc["id"],
                                    main_chat=True, fallback_prompt=fallback,
-                                   on_options=opts.extend,
+                                   on_options=opts.extend, on_turn=turn.extend,
                                    on_prompt=lambda t, b: wx_ask_permission(user, t, b))).strip()
-    if out:
-        hist.append(ChatMessage(role="assistant", content=out))
-        del hist[:-12]
     if opts:
         _wx_options[user] = list(opts)
-        out = wx_format_options(out, opts)
-    return out or "（没有收到回复，请稍后重试）"
+    replies = wx_turn_replies(turn, opts) if turn else []
+    texts = [it["v"] for it in turn if it.get("k") == "t"] or ([out] if out else [])
+    if texts:
+        hist.append(ChatMessage(role="assistant", content="\n\n".join(texts)))
+        del hist[:-12]
+    if replies:
+        return replies
+    if out:
+        return [("text", wx_format_options(out, opts) if opts else out)]
+    return [("text", "（没有收到回复，请稍后重试）")]
 
 
 def _wx_handle(user: str, text: str) -> list:
@@ -2550,7 +2590,7 @@ def _wx_handle_locked(user: str, text: str) -> list:
         return [("text", "已清空对话上下文。")]
     if text.strip() in ("/帮助", "/help", "/?"):
         return [("text", WX_HELP)]
-    return [("text", _wx_chat(user, text))]
+    return _wx_chat(user, text)
 
 
 weixin = WeixinBot(CFG.weixin_file, _wx_handle, allow_env=CFG.weixin_allow_from)

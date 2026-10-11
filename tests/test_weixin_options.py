@@ -26,7 +26,7 @@ def test_chat_uses_main_chat_and_options():
     seen = {}
 
     def fake_stream(cookies, prompt, exp, timeout, account_id=None, main_chat=False,
-                    fallback_prompt=None, on_options=None, on_prompt=None):
+                    fallback_prompt=None, on_options=None, on_prompt=None, on_turn=None):
         seen.update(prompt=prompt, main=main_chat, fb=fallback_prompt)
         yield TEXT
         on_options(OPTS)
@@ -35,9 +35,23 @@ def test_chat_uses_main_chat_and_options():
     app.store.pick_account = lambda **k: {"id": "a", "cookies": {}, "cookies_exp": None}
     out = app._wx_chat("u", "整理旁聊")
     assert seen["prompt"] == "整理旁聊" and seen["main"] is True and "整理旁聊" in seen["fb"]
-    assert "2. 只删打招呼" in out
+    assert out[0][0] == "text" and "2. 只删打招呼" in out[0][1]
     app._wx_chat("u", "2")
     assert seen["prompt"] == OPTS[1]
+
+
+def test_turn_replies_keep_order_files_and_code():
+    turn = [{"k": "t", "v": "已创建 `hello_world.py`："},
+            {"k": "f", "name": "hello_world.py", "idx": 0, "data": b'print("hi")\n'},
+            {"k": "f", "name": "bad/名字?.txt", "idx": 1, "data": None},
+            {"k": "t", "v": "内容：\n```python\nprint('hi')\n```"}]
+    r = app.wx_turn_replies(turn, [])
+    assert [x[0] for x in r] == ["text", "media", "text", "text"], r
+    assert r[1][2] == "file" and open(r[1][1], "rb").read() == b'print("hi")\n'
+    assert r[1][1].endswith("hello_world.py")
+    assert "没能取回" in r[2][1] and "```python\nprint('hi')\n```" in r[3][1]
+    r = app.wx_turn_replies(turn, ["A", "B"])
+    assert r[-1][1].endswith("回复数字选择，或直接回复文字。") and "1. A" in r[-1][1]
 
 
 def test_permission_prompt_roundtrip():
@@ -128,6 +142,7 @@ def test_same_user_messages_are_serialized():
 if __name__ == "__main__":
     test_format_and_resolve()
     test_chat_uses_main_chat_and_options()
+    test_turn_replies_keep_order_files_and_code()
     test_permission_prompt_roundtrip()
     test_engine_dialog_handling()
     test_enter_chat_binding()
