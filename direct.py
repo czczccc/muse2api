@@ -266,6 +266,7 @@ class DirectClient:
             except Exception as exc:  # noqa: BLE001
                 m = re.search(r"missing field `(\w+)`", str(exc))
                 if not m or m.group(1) not in fill or m.group(1) in body:
+                    log.warning("%s 失败（字段 %s）：%s", method, sorted(body), str(exc)[:400])
                     raise
                 body[m.group(1)] = fill[m.group(1)]
         raise RuntimeError(f"{method} 字段补不全：{sorted(body)}")
