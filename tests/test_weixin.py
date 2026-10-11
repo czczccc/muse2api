@@ -139,3 +139,14 @@ if __name__ == "__main__":
     test_send_file_item()
     test_expired_session()
     print("weixin tests OK")
+
+
+def test_compact_replies_limits_messages():
+    many = [("text", f"段落{i}") for i in range(11)] + [("media", "/x.png", "image")] * 3
+    out = W.compact_replies(many)
+    n = sum(len(W.split_text(r[1])) if r[0] == "text" else 1 for r in out)
+    assert n <= W.MAX_REPLIES, (n, out)
+    assert out[0][0] == "text" and "段落10" in out[0][1], "相邻文本应合并成一条"
+    big = [("text", "a" * 1700 + "\n" + "b" * 1700 * 12)]
+    out = W.compact_replies(big)
+    assert sum(len(W.split_text(r[1])) for r in out) <= W.MAX_REPLIES

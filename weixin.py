@@ -71,6 +71,32 @@ def split_text(text: str, limit: int = MAX_TEXT) -> list[str]:
     return [x for x in out if x.strip()]
 
 
+MAX_REPLIES = 10   # 实测：一条入站消息（一个 context_token）最多回 10 条，超出 sendmessage 返回 ret=-2 prepare failed
+
+
+def compact_replies(replies: list, limit: int = MAX_REPLIES) -> list:
+    """把相邻文本合并，并保证实际发出的消息数不超过 limit（文本会按长度再分段，也要计入）。"""
+    merged: list = []
+    for r in replies:
+        if r[0] == "text" and merged and merged[-1][0] == "text":
+            merged[-1] = ("text", merged[-1][1] + "\n\n" + r[1])
+        else:
+            merged.append(r)
+    out, used = [], 0
+    for i, r in enumerate(merged):
+        n = len(split_text(r[1])) if r[0] == "text" else 1
+        if used + n > limit - (0 if i == len(merged) - 1 else 1) and out:
+            out.append(("text", "（回复内容较多，后面的部分已省略，请到 muse.ai 页面查看）"))
+            return out
+        if used + n > limit:        # 单条文本就超限：截断分段
+            parts = split_text(r[1])[:max(1, limit - used - 1)]
+            out.append(("text", "\n".join(parts) + "\n…（已截断，请到 muse.ai 页面查看）"))
+            return out
+        out.append(r)
+        used += n
+    return out
+
+
 # ---------------------------- iLink HTTP 客户端 ----------------------------
 class ILinkClient:
     def __init__(self, base_url: str = DEFAULT_BASE, token: str = "",
@@ -140,9 +166,16 @@ class ILinkClient:
                 raise RuntimeError("getuploadurl 未返回上传地址")
             full = f"{self.cdn}/upload?encrypted_query_param={quote(param)}&filekey={quote(filekey)}"
         last = None
-        for _ in range(3):
-            r = self.http.post(full, data=cipher, timeout=120,
-                               headers={"Content-Type": "application/octet-stream"})
+        for attempt in range(3):
+            try:
+                r = self.http.post(full, data=cipher, timeout=120,
+                                   headers={"Content-Type": "application/octet-stream",
+                                            "Connection": "close"})
+            except requests.RequestException as exc:   # TLS 被对端中断等：换新连接重试
+                last = f"{type(exc).__name__}: {str(exc)[:120]}"
+                log.warning("CDN 上传第 %d 次网络错误（%d 字节）: %s", attempt + 1, len(cipher), last)
+                time.sleep(1.5 * (attempt + 1))
+                continue
             if 400 <= r.status_code < 500:
                 raise RuntimeError(f"CDN 上传被拒绝: {r.headers.get('x-error-message') or r.text[:100]}")
             dl = r.headers.get("x-encrypted-param")
@@ -354,6 +387,7 @@ class WeixinBot:
         except Exception as exc:  # noqa: BLE001
             log.exception("微信消息处理失败")
             replies = [("text", f"处理失败：{str(exc)[:200]}")]
+        replies = compact_replies(replies)
         log.info("微信回复 %s：%s", user[-6:], [(r[0], r[2] if r[0] == "media" else len(r[1])) for r in replies])
         for r in replies:
             try:
