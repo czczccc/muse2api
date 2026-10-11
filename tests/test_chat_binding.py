@@ -35,7 +35,20 @@ def test_turn_media_is_forwarded():
     assert "没能取回" in r[3][1]
 
 
+def test_new_turn_items_ignores_history():
+    e = object.__new__(engine_mod.MuseEngine)
+    hist = [{"k": "t", "v": "旧回复"}, {"k": "m", "kind": "image", "src": "blob:old"}]
+    page = {"items": list(hist)}
+    e._poll_turn = lambda: list(page["items"])
+    base = e._turn_baseline()
+    # 旧内容的下标发生变化（按下标切片会把旧图再发一遍），只应取回基线之后新增的内容
+    page["items"] = [{"k": "t", "v": "新回复"}] + hist + [{"k": "m", "kind": "image", "src": "blob:new"}]
+    got = [i.get("v") or i.get("src") for i in e._new_turn_items(base)]
+    assert got == ["新回复", "blob:new"], got
+
+
 if __name__ == "__main__":
     test_close_page_keeps_chat_binding()
     test_turn_media_is_forwarded()
+    test_new_turn_items_ignores_history()
     print("PASS")

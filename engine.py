@@ -1281,13 +1281,34 @@ class MuseEngine:
                 text:(u.innerText||'').trim().slice(0,40)};}));
     })()"""
 
-    def _report_turn(self, on_turn, base: int, wait_media: bool = False):
+    @staticmethod
+    def _turn_sig(it: dict) -> tuple:
+        return (it.get("k"), it.get("v") or it.get("src") or it.get("name") or "")
+
+    def _turn_baseline(self):
+        """发送前页面上已有的气泡/附件签名。按内容而不是按下标区分「这一轮新增」：
+        主要聊天的历史会分批加载，按下标切片会把旧图、旧文件又当成新回复发一遍。"""
+        from collections import Counter
+        return Counter(self._turn_sig(i) for i in self._poll_turn())
+
+    def _new_turn_items(self, base) -> list[dict]:
+        left = base.copy()
+        out = []
+        for it in self._poll_turn():
+            sig = self._turn_sig(it)
+            if left[sig] > 0:
+                left[sig] -= 1
+            else:
+                out.append(it)
+        return out
+
+    def _report_turn(self, on_turn, base, wait_media: bool = False):
         """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。
         wait_media=True（用户在要图/视频/文件）时，文字说完后附件可能还在生成，多等一会儿再取。"""
         if on_turn is None:
             return
         time.sleep(0.4)
-        items = self._poll_turn()[base:]
+        items = self._new_turn_items(base)
         if wait_media:
             t_end = time.time() + 45.0
             stable_since = time.time()
@@ -1296,7 +1317,7 @@ class MuseEngine:
                 if has_media and time.time() - stable_since >= 3.0:
                     break
                 time.sleep(1.0)
-                cur = self._poll_turn()[base:]
+                cur = self._new_turn_items(base)
                 if len(cur) != len(items):
                     stable_since = time.time()
                 items = cur
@@ -1358,8 +1379,10 @@ class MuseEngine:
             self.reset_thread(for_chat=True)
         want_media = bool(re.search(r"图|画|照片|海报|视频|文件|生成|导出|下载|image|picture|photo|video|file|draw|generate",
                                     prompt or "", re.I))
+        if on_turn is not None and main_chat:
+            self._wait_chat_loaded()      # 历史分批加载，等稳定了再取基线
         base_agent, base_text, _ = self._poll_chat()
-        base_turn = len(self._poll_turn()) if on_turn is not None else 0
+        base_turn = self._turn_baseline() if on_turn is not None else None
         self._send(prompt)
         if main_chat and fresh:
             self._remember_thread(account_id)
