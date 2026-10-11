@@ -39,10 +39,11 @@ img,video{max-width:100%}.row{display:flex;gap:6px}.row>input{flex:1}
 
 <script>
 const $=id=>document.getElementById(id);
-let K=localStorage.getItem('m2a_key')||'';$('key').value=K;
-function saveKey(){K=$('key').value.trim();localStorage.setItem('m2a_key',K);loadAccs()}
+$('key').value=localStorage.getItem('m2a_key')||'';
+const getK=()=>$('key').value.trim();
+function saveKey(){localStorage.setItem('m2a_key',getK());loadAccs()}
 async function api(path,opt={}){
-  opt.headers={...(opt.headers||{}),Authorization:'Bearer '+K};
+  opt.headers={...(opt.headers||{}),Authorization:'Bearer '+getK()};
   if(opt.json){opt.body=JSON.stringify(opt.json);opt.headers['Content-Type']='application/json';delete opt.json}
   const r=await fetch(path,opt);const t=await r.text();let d;try{d=JSON.parse(t)}catch{d=t}
   if(!r.ok)throw new Error((d&&(d.error&&d.error.message||d.detail))||t);return d}
@@ -58,7 +59,7 @@ async function testAcc(id){try{const r=await api('/admin/accounts/'+id+'/test',{
 async function delAcc(id){if(confirm('删除？')){await api('/admin/accounts/'+id,{method:'DELETE'});loadAccs()}}
 async function chat(){
   $('chatOut').textContent='…';
-  try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+K,'Content-Type':'application/json'},
+  try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+getK(),'Content-Type':'application/json'},
     body:JSON.stringify({model:'muse-spark',stream:true,messages:[{role:'user',content:$('chatIn').value}]})});
   if(!r.ok){$('chatOut').textContent=await r.text();return}
   const rd=r.body.getReader(),dec=new TextDecoder();let buf='',out='';$('chatOut').textContent='';
@@ -84,5 +85,5 @@ async function wxLogin(){try{const d=await api('/admin/weixin/login',{method:'PO
   clearInterval(wxTimer);wxTimer=setInterval(wxPoll,2500)}catch(e){$('wxOut').textContent=e.message}}
 async function wxPoll(){try{const d=await api('/admin/weixin/login/status');$('wxOut').textContent=JSON.stringify(d,null,1);if(d.status==='connected')clearInterval(wxTimer)}catch(e){$('wxOut').textContent=e.message;clearInterval(wxTimer)}}
 async function wxStatus(){try{$('wxOut').textContent=JSON.stringify(await api('/admin/weixin'),null,1)}catch(e){$('wxOut').textContent=e.message}}
-if(K)loadAccs();
+if(getK())loadAccs();
 </script></body></html>
