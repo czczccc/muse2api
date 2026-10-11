@@ -47,6 +47,7 @@ from pydantic import BaseModel, Field
 from config import CFG
 from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
 from store import Store, account_expiry, min_expiry
+from weixin import WeixinBot
 
 import sys
 log = logging.getLogger("muse2api")
@@ -2421,6 +2422,106 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     return await asyncio.to_thread(_do_push)
 
 
+# ------------------------- 微信 ClawBot 接入 -------------------------
+WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
+           "/重置：清空对话上下文\n/帮助：显示本说明")
+_wx_history: dict[str, list[ChatMessage]] = {}
+
+
+def _wx_chat(user: str, text: str) -> str:
+    hist = _wx_history.setdefault(user, [])
+    hist.append(ChatMessage(role="user", content=text))
+    del hist[:-12]
+    prompt = build_chat_prompt(hist)
+    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    if not acc:
+        raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
+    out = "".join(safe_chat_stream(acc["cookies"], prompt, acc.get("cookies_exp"),
+                                   CFG.chat_timeout, account_id=acc["id"])).strip()
+    if out:
+        hist.append(ChatMessage(role="assistant", content=out))
+        del hist[:-12]
+    return out or "（没有收到回复，请稍后重试）"
+
+
+def _wx_handle(user: str, text: str) -> list:
+    """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
+    m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
+    if m:
+        kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
+        prompt = m.group(2).strip()
+        if not prompt:
+            return [("text", "请在命令后面写上描述，例如：/画 一只戴宇航头盔的柴犬")]
+        if kind == "image":
+            res, _ = _run_generation(build_image_prompt(ImageRequest(prompt=prompt)),
+                                     "image", CFG.image_timeout)
+        else:
+            res, _ = _run_generation(build_video_prompt(VideoRequest(prompt=prompt)),
+                                     "video", CFG.video_timeout)
+        path = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
+        return [("media", path, "video" if res.get("kind") == "video" else "image")]
+    if text.strip() in ("/重置", "/reset", "/new"):
+        _wx_history.pop(user, None)
+        return [("text", "已清空对话上下文。")]
+    if text.strip() in ("/帮助", "/help", "/?"):
+        return [("text", WX_HELP)]
+    return [("text", _wx_chat(user, text))]
+
+
+weixin = WeixinBot(CFG.weixin_file, _wx_handle, allow_env=CFG.weixin_allow_from)
+
+
+def _qr_svg(content: str) -> str:
+    """把扫码内容渲染成内联 SVG（segno 缺失时返回空串，页面回退为显示链接）。"""
+    try:
+        import segno
+    except ImportError:
+        return ""
+    buf = io.BytesIO()
+    segno.make(content, error="m").save(buf, kind="svg", scale=6, border=2, xmldecl=False)
+    return buf.getvalue().decode()
+
+
+@app.get("/admin/weixin")
+def weixin_status(_=Depends(auth)):
+    return {"enabled": CFG.weixin_enabled, **weixin.info()}
+
+
+@app.post("/admin/weixin/login")
+async def weixin_login(_=Depends(auth)):
+    if not CFG.weixin_enabled:
+        raise HTTPException(400, "微信接入已被 MUSE2API_WEIXIN_ENABLED=0 关闭")
+    try:
+        info = await asyncio.to_thread(weixin.start_login)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"获取二维码失败: {exc}") from exc
+    return {**info, "svg": _qr_svg(info.get("content") or "")}
+
+
+@app.get("/admin/weixin/login/status")
+async def weixin_login_status(_=Depends(auth)):
+    try:
+        await asyncio.to_thread(weixin.poll_login)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"查询扫码状态失败: {exc}") from exc
+    return weixin.info()
+
+
+@app.post("/admin/weixin/logout")
+def weixin_logout(_=Depends(auth)):
+    weixin.disconnect()
+    return weixin.info()
+
+
+@app.post("/admin/weixin/allow")
+def weixin_allow(payload: dict = Body(default={}), _=Depends(auth)):
+    users = payload.get("users") or []
+    if not isinstance(users, list):
+        raise HTTPException(400, "users 需为数组")
+    weixin.set_allow([str(u) for u in users])
+    return weixin.info()
+
+
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
@@ -2433,8 +2534,11 @@ async def _startup():
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
+    if CFG.weixin_enabled:
+        weixin.start()
 
 
 @app.on_event("shutdown")
 def _shutdown():
+    weixin.stop()
     engine.stop()

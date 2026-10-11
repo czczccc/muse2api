@@ -270,6 +270,7 @@
     <button data-t="cookie">获取 Cookie</button>
     <button data-t="tasks">任务记录</button>
     <button data-t="media">媒体库</button>
+    <button data-t="weixin">微信接入</button>
     <button data-t="play">接口测试</button>
     <button data-t="docs">接入文档</button>
   </nav>
@@ -556,6 +557,32 @@
         </div>
       </div>
       <div class="grid" id="mediaGrid"><div class="empty">加载中…</div></div>
+    </div>
+  </section>
+
+  <!-- ==================== 微信接入 ==================== -->
+  <section class="tab" id="tab-weixin">
+    <div class="card">
+      <h3>微信 ClawBot 接入 <span class="tag">iLink Bot</span></h3>
+      <div class="hint">
+        生成二维码，用微信扫码并在手机上确认，就能在微信里直接和 muse2api 对话。
+        只支持私聊；机器人只能回复 24 小时内给它发过消息的会话。<br>
+        微信里发文字=对话，<code>/画 描述</code>=生图，<code>/视频 描述</code>=生视频，<code>/重置</code>=清空上下文。
+      </div>
+      <div id="wxState" style="margin:12px 0;font-weight:600">加载中…</div>
+      <div id="wxQrBox" style="display:none;margin:12px 0">
+        <div id="wxQr" style="width:220px;height:220px;background:#fff;padding:8px;border-radius:8px"></div>
+        <div class="hint" id="wxQrHint" style="margin-top:8px"></div>
+      </div>
+      <div id="wxAllowBox" style="display:none;margin:12px 0">
+        <label>允许使用的微信用户 ID（每行一个；默认只有扫码本人）</label>
+        <textarea id="wxAllow" rows="3" style="width:100%"></textarea>
+        <div style="margin-top:8px"><button class="ghost mini" onclick="wxSaveAllow()">保存白名单</button></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="primary-lg" id="wxLoginBtn" onclick="wxLogin()">生成二维码</button>
+        <button class="ghost" id="wxLogoutBtn" onclick="wxLogout()" style="display:none">断开连接</button>
+      </div>
     </div>
   </section>
 
@@ -862,9 +889,75 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     $('tab-' + b.dataset.t).classList.add('active');
     if (b.dataset.t === 'tasks') loadTasks();
     if (b.dataset.t === 'media') loadMedia();
+    if (b.dataset.t === 'weixin') wxRefresh();
     if (b.dataset.t === 'cookie') $('cmdText').textContent = buildCmd($('inBase').value);
   };
 });
+
+/* ================= 微信接入 ================= */
+let wxTimer = null;
+const WX_TEXT = {disconnected:'未连接', connected:'✅ 已连接', expired:'⚠️ 会话已失效，请重新扫码'};
+const WX_LOGIN_TEXT = {wait:'请用微信扫描二维码', scaned:'已扫码，请在手机上点击确认',
+  expired:'二维码已过期，请重新生成', need_verifycode:'需要在手机上输入验证码',
+  scaned_but_redirect:'已扫码，正在跳转…', binded_redirect:'该微信已绑定其他机器人'};
+
+function wxRender(d){
+  let t = WX_TEXT[d.status] || d.status;
+  if (d.status === 'connected' && d.bot_id) t += '（机器人 ' + d.bot_id + '）';
+  if (d.last_error) t += '　最近错误：' + d.last_error;
+  $('wxState').textContent = t;
+  const connected = d.status === 'connected';
+  $('wxLogoutBtn').style.display = connected ? '' : 'none';
+  $('wxLoginBtn').textContent = connected ? '重新扫码' : '生成二维码';
+  $('wxAllowBox').style.display = connected ? '' : 'none';
+  if (connected && document.activeElement !== $('wxAllow')) $('wxAllow').value = (d.allow_from || []).join('\n');
+  const lg = d.login;
+  if (lg && lg.status && lg.status !== 'none'){
+    $('wxQrBox').style.display = '';
+    $('wxQrHint').textContent = WX_LOGIN_TEXT[lg.status] || lg.status;
+  } else if (connected) {
+    $('wxQrBox').style.display = 'none';
+    wxStopPoll();
+  }
+}
+
+function wxStopPoll(){ if (wxTimer){ clearInterval(wxTimer); wxTimer = null; } }
+
+async function wxRefresh(){
+  try{ wxRender(await api('/admin/weixin')); }
+  catch(e){ $('wxState').textContent = e.message; }
+}
+
+async function wxLogin(){
+  try{
+    const d = await api('/admin/weixin/login', {method:'POST'});
+    $('wxQrBox').style.display = '';
+    if (d.svg) $('wxQr').innerHTML = d.svg;
+    else $('wxQr').innerHTML = '<a href="' + esc(d.content) + '" target="_blank" style="color:#000;word-break:break-all">' + esc(d.content) + '</a>';
+    $('wxQrHint').textContent = WX_LOGIN_TEXT.wait;
+    wxStopPoll();
+    wxTimer = setInterval(async () => {
+      try{
+        const s = await api('/admin/weixin/login/status');
+        wxRender(s);
+        if (s.status === 'connected') toast('微信已连接', 'ok');
+        if (s.login && s.login.status === 'expired') wxStopPoll();
+      }catch(e){ /* 下次再试 */ }
+    }, 2500);
+  }catch(e){ toast(e.message, 'bad'); }
+}
+
+async function wxLogout(){
+  if (!confirm('确定断开微信连接？')) return;
+  try{ wxRender(await api('/admin/weixin/logout', {method:'POST'})); }
+  catch(e){ toast(e.message, 'bad'); }
+}
+
+async function wxSaveAllow(){
+  const users = $('wxAllow').value.split('\n').map(s => s.trim()).filter(Boolean);
+  try{ wxRender(await api('/admin/weixin/allow', {method:'POST', body: JSON.stringify({users})})); toast('已保存', 'ok'); }
+  catch(e){ toast(e.message, 'bad'); }
+}
 
 /* ================= 接入信息 / API Key ================= */
 let realKey = '';

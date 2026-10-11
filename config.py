@@ -118,6 +118,13 @@ class Config:
     keepalive_disabled_accounts: bool = field(
         default_factory=lambda: _env("MUSE2API_KEEPALIVE_DISABLED_ACCOUNTS", "0").strip() != "0")
 
+    # 微信 ClawBot 接入：WEIXIN_ENABLED=0 可整体关闭；WEIXIN_ALLOW_FROM 为额外放行的
+    # 微信用户 ID（逗号分隔）。扫码本人默认自动放行。
+    weixin_enabled: bool = field(
+        default_factory=lambda: _env("MUSE2API_WEIXIN_ENABLED", "1").strip() != "0")
+    weixin_allow_from: str = field(
+        default_factory=lambda: _env("MUSE2API_WEIXIN_ALLOW_FROM", ""))
+
     @property
     def data_dir(self) -> str:
         return os.path.join(self.base_dir, "data")
@@ -138,6 +145,10 @@ class Config:
     @property
     def accounts_file(self) -> str:
         return os.path.join(self.data_dir, "accounts.json")
+
+    @property
+    def weixin_file(self) -> str:
+        return os.path.join(self.data_dir, "weixin.json")
 
     @property
     def tasks_file(self) -> str:
