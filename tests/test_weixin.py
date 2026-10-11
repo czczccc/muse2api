@@ -150,3 +150,41 @@ def test_compact_replies_limits_messages():
     big = [("text", "a" * 1700 + "\n" + "b" * 1700 * 12)]
     out = W.compact_replies(big)
     assert sum(len(W.split_text(r[1])) for r in out) <= W.MAX_REPLIES
+
+
+def test_send_retries_without_token_on_prepare_failed():
+    calls = []
+
+    class C(W.ILinkClient):
+        def _post(self, path, body, timeout=15):
+            calls.append(body["msg"]["context_token"])
+            return {"ret": -2, "errmsg": "prepare failed"} if body["msg"]["context_token"] else {}
+
+    C(token="t").send_text("u", "hi", "tok")
+    assert calls == ["tok", ""], calls
+
+
+def test_typing_and_ctx_persist():
+    d = tempfile.mkdtemp()
+    seen = []
+
+    class TC(FakeClient):
+        def get_typing_ticket(self, user, ctx):
+            return "TICKET"
+
+        def send_typing(self, user, ticket, typing=True):
+            seen.append((ticket, typing))
+
+    FakeClient.sent = []
+    bot = W.WeixinBot(os.path.join(d, "wx.json"), lambda u, t: (time.sleep(0.2), [("text", "ok")])[1],
+                      client_factory=TC)
+    bot.state["bot_token"] = "x"
+    bot._dispatch({"message_type": 1, "message_id": 1, "from_user_id": "u1", "context_token": "ctx1",
+                   "item_list": [{"type": 1, "text_item": {"text": "hi"}}]})
+    bot.allow_env = ["u1"]
+    bot._dispatch({"message_type": 1, "message_id": 2, "from_user_id": "u1", "context_token": "ctx2",
+                   "item_list": [{"type": 1, "text_item": {"text": "hi"}}]})
+    time.sleep(0.8)
+    assert seen and seen[0] == ("TICKET", True) and seen[-1] == ("TICKET", False), seen
+    bot2 = W.WeixinBot(os.path.join(d, "wx.json"), lambda u, t: [], client_factory=TC)
+    assert bot2._ctx.get("u1") == "ctx2", "context_token 应该存盘，重启后还在"

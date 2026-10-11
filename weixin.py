@@ -32,7 +32,10 @@ CHANNEL_VERSION = "2.4.6"
 ERR_SESSION_EXPIRED = -14
 MEDIA_TYPE = {"image": 1, "video": 2, "file": 3}
 ITEM_TYPE = {"text": 1, "image": 2, "video": 5, "file": 4}
-MAX_TEXT = 1800  # 单条文本保守上限，超长自动分段
+MAX_TEXT = 4000  # 单条文本上限（参考 Hermes 的实测值），超长按段落自动分段
+CHUNK_GAP = 0.3  # 连续发送多条之间的间隔，避免被限流丢消息
+TYPING_REFRESH = 4.0
+TYPING_TICKET_TTL = 600
 
 
 # ---------------------------- AES-128-ECB (PKCS7) ----------------------------
@@ -143,13 +146,30 @@ class ILinkClient:
                "message_state": 2, "context_token": context_token, "item_list": [item]}
         res = self._post("/ilink/bot/sendmessage", {"msg": msg})
         code = res.get("ret", res.get("errcode", 0)) or 0
+        if code == -2 and context_token:
+            # prepare failed：context_token 过期或已用完，不带 token 再试一次（Hermes 同样这样处理）
+            log.warning("sendmessage prepare failed，改为不带 context_token 重试一次")
+            msg["context_token"] = ""
+            res = self._post("/ilink/bot/sendmessage", {"msg": msg})
+            code = res.get("ret", res.get("errcode", 0)) or 0
         if code:
             raise RuntimeError(f"sendmessage 失败 ret={code} {res.get('errmsg', '')}")
         return res
 
     def send_text(self, to_user: str, text: str, context_token: str):
-        for part in split_text(text):
+        for i, part in enumerate(split_text(text)):
+            if i:
+                time.sleep(CHUNK_GAP)
             self._send(to_user, {"type": ITEM_TYPE["text"], "text_item": {"text": part}}, context_token)
+
+    # 「对方正在输入」提示：getconfig 取 typing_ticket，sendtyping 的 status 1=开始、2=取消
+    def get_typing_ticket(self, to_user: str, context_token: str) -> str:
+        res = self._post("/ilink/bot/getconfig", {"ilink_user_id": to_user, "context_token": context_token})
+        return res.get("typing_ticket") or ""
+
+    def send_typing(self, to_user: str, ticket: str, typing: bool = True):
+        self._post("/ilink/bot/sendtyping", {"ilink_user_id": to_user, "typing_ticket": ticket,
+                                             "status": 1 if typing else 2})
 
     def upload_media(self, data: bytes, kind: str, to_user: str) -> dict:
         aeskey = secrets.token_bytes(16)
@@ -222,7 +242,9 @@ class WeixinBot:
         self._thread: threading.Thread | None = None
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wx")
         self._seen: list = []
-        self._ctx: dict[str, str] = {}   # 每个用户最近一条入站消息的 context_token
+        # 每个用户最近一条入站消息的 context_token；存盘，重启后也能回复
+        self._ctx: dict[str, str] = dict(self.state.get("ctx") or {})
+        self._typing: dict[str, tuple[str, float]] = {}   # 用户 -> (typing_ticket, 取得时间)
         if self.state.get("bot_token"):
             self.status = "connected"
 
@@ -378,18 +400,51 @@ class WeixinBot:
             log.info("微信消息被白名单拦截: %s", user)
             return
         self._ctx[user] = ctx
+        if ctx and self.state.setdefault("ctx", {}).get(user) != ctx:
+            self.state["ctx"][user] = ctx
+            self._save()
         self.pool.submit(self._handle, user, text, ctx)
+
+    def _typing_start(self, client, user: str, ctx: str):
+        """处理期间持续给对方显示「正在输入」，返回停止用的 Event；失败一律忽略，不影响回复。"""
+        if not hasattr(client, "send_typing"):
+            return None
+        stop = threading.Event()
+
+        def run():
+            try:
+                ticket, ts = self._typing.get(user, ("", 0.0))
+                if not ticket or time.time() - ts > TYPING_TICKET_TTL:
+                    ticket = client.get_typing_ticket(user, ctx)
+                    self._typing[user] = (ticket, time.time())
+                if not ticket:
+                    return
+                while not stop.is_set():
+                    client.send_typing(user, ticket, True)
+                    stop.wait(TYPING_REFRESH)
+                client.send_typing(user, ticket, False)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("正在输入提示失败（忽略）: %s", exc)
+
+        threading.Thread(target=run, daemon=True, name="wx-typing").start()
+        return stop
 
     def _handle(self, user: str, text: str, ctx: str):
         client = self._client()
+        typing = self._typing_start(client, user, ctx)
         try:
             replies = self.handler(user, text)
         except Exception as exc:  # noqa: BLE001
             log.exception("微信消息处理失败")
             replies = [("text", f"处理失败：{str(exc)[:200]}")]
+        finally:
+            if typing is not None:
+                typing.set()
         replies = compact_replies(replies)
         log.info("微信回复 %s：%s", user[-6:], [(r[0], r[2] if r[0] == "media" else len(r[1])) for r in replies])
-        for r in replies:
+        for i, r in enumerate(replies):
+            if i:
+                time.sleep(CHUNK_GAP)
             try:
                 if r[0] == "text":
                     client.send_text(user, r[1], ctx)
