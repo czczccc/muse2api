@@ -187,7 +187,8 @@ class MuseEngine:
                 self._active_contexts.discard(ctx_id)
             self.current_context_id = None
         self.current_acc_id = None
-        self._chat_urls.clear()
+        # 注意：不要在这里清 _chat_urls。每次请求结束都会关页面，
+        # 绑定的对话会话 URL 要跨请求保留；只有 /重置 才通过 forget_chat_binding 清掉。
 
     def _open_page(self):
         """为当前工作线程创建独立的页面。
@@ -419,7 +420,28 @@ class MuseEngine:
         if not self.page:
             return False
         try:
-            clicked = self.page.js("""(function(){
+            clicked = False
+            t_find = time.time() + 8.0      # 新开的页面侧栏可能还没渲染出来，等一等再放弃
+            while not clicked and time.time() < t_find:
+                clicked = self._click_main_chat()
+                if not clicked:
+                    time.sleep(0.5)
+            if not clicked:
+                return False
+            t_end = time.time() + 10.0
+            while time.time() < t_end:
+                time.sleep(0.1)
+                if self.page.js("!!document.querySelector('textarea')"):
+                    break
+            time.sleep(0.6)
+            self._wait_ws_ready(self.page, timeout=12.0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _click_main_chat(self) -> bool:
+        try:
+            return bool(self.page.js("""(function(){
                 var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
                 function clickable(el){
                     var n = el;
@@ -442,17 +464,7 @@ class MuseEngine:
                     if (re.test(v)) { clickable(attrs[i]).click(); return true; }
                 }
                 return false;
-            })()""")
-            if not clicked:
-                return False
-            t_end = time.time() + 10.0
-            while time.time() < t_end:
-                time.sleep(0.1)
-                if self.page.js("!!document.querySelector('textarea')"):
-                    break
-            time.sleep(0.6)
-            self._wait_ws_ready(self.page, timeout=12.0)
-            return True
+            })()"""))
         except Exception:  # noqa: BLE001
             return False
 
@@ -1181,7 +1193,12 @@ class MuseEngine:
         var u=units[i];
         if(inUser(u)) continue;
         if(u.matches(ATT)){
-          if(u.querySelector('img,video')&&!/\.[A-Za-z0-9]{1,8}\s*$/.test((u.innerText||'').trim())) continue;
+          var mm=u.querySelector('img,video');
+          if(mm&&!/\.[A-Za-z0-9]{1,8}\s*$/.test((u.innerText||'').trim())){
+            var ms=mm.currentSrc||mm.src||'';
+            if(ms) items.push({k:'m',kind:mm.tagName==='VIDEO'?'video':'image',src:ms,idx:allAtt.indexOf(u)});
+            continue;
+          }
           items.push({k:'f',name:nameOf(u),idx:allAtt.indexOf(u)});
         }else if(!u.closest(ATT)){
           var t=conv(u).replace(/\n{3,}/g,NL+NL).trim();
@@ -1265,6 +1282,16 @@ class MuseEngine:
         for it in items:
             if it.get("k") == "f":
                 it["data"] = self._fetch_attachment(it["idx"], it["name"])
+            elif it.get("k") == "m":
+                try:
+                    it["data"], it["mime"], _ = self.extract_bytes(it["src"], it.get("kind", "image"), retries=2)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("取回聊天里的%s失败: %s", it.get("kind"), exc)
+                    it["data"] = None
+        log.info("本轮回复解析：文本 %d 段、文件 %d 个、图片/视频 %d 个",
+                 sum(1 for i in items if i.get("k") == "t"),
+                 sum(1 for i in items if i.get("k") == "f"),
+                 sum(1 for i in items if i.get("k") == "m"))
         if items:
             on_turn(items)
 

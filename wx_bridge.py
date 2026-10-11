@@ -22,6 +22,7 @@ router = APIRouter()
 WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
            "/重置：开始新话题（若接入的是 muse 主要聊天，其中的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
+_wx_accounts: dict[str, str] = {}   # 微信用户 -> 固定使用的账号
 
 
 _wx_options: dict[str, list[str]] = {}
@@ -96,6 +97,19 @@ def wx_turn_replies(turn: list[dict], opts: list[str]) -> list:
     for it in turn:
         if it.get("k") == "t":
             replies.append(("text", it["v"]))
+        elif it.get("k") == "m":
+            kind = "video" if it.get("kind") == "video" else "image"
+            data = it.get("data")
+            if data:
+                ext = ".mp4" if kind == "video" else (".jpg" if "jpeg" in (it.get("mime") or "") else ".png")
+                d = os.path.join(CFG.download_dir, "wx")
+                os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, f"{uuid.uuid4().hex[:8]}{ext}")
+                with open(path, "wb") as f:
+                    f.write(data)
+                replies.append(("media", path, kind))
+            else:
+                replies.append(("text", f"（{'视频' if kind == 'video' else '图片'}没能取回，请到 muse.ai 页面查看）"))
         elif it.get("k") == "f":
             name = _wx_safe_name(it.get("name", ""))
             data = it.get("data")
@@ -126,7 +140,12 @@ def _wx_chat(user: str, text: str) -> list:
     hist.append(ChatMessage(role="user", content=text))
     del hist[:-12]
     fallback = build_chat_prompt(hist)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    # 同一微信用户固定用同一个账号：对话会话是按账号记住的，轮换账号就会每条消息新开一个旁聊
+    acc = store.get_account(_wx_accounts.get(user) or "")
+    if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
+        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+        if acc:
+            _wx_accounts[user] = acc["id"]
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
     opts: list[str] = []
@@ -177,6 +196,7 @@ def _wx_handle_locked(user: str, text: str) -> list:
     if text.strip() in ("/重置", "/reset", "/new"):
         _wx_history.pop(user, None)
         _wx_options.pop(user, None)
+        _wx_accounts.pop(user, None)
         engine.forget_chat_binding()
         return [("text", "已清空对话上下文。")]
     if text.strip() in ("/帮助", "/help", "/?"):
