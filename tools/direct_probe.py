@@ -50,8 +50,8 @@ else:
     m = direct._presentation_media(direct._payload(pres[-1]))[0]
     p = m["path"]
     print("path =", p, "| url =", (m.get("alt_url") or "")[:80])
-    for meth, body in (("fs.read", {"path": p, "offset": 0, "length": 64, "limit": 64}),
-                       ("fs.read", {"path": p, "offset": 0})):
+    for meth, body in (("fs.read", {"path": p, "offset": 0, "len": 64}),
+                       ("fs.read", {"path": p, "offset": 0, "len": 64, "encoding": "base64"})):
         try:
             raw = c.gw.request(meth, body=body, timeout=30)
             print(meth, body, "-> OK", len(raw), "字节，开头:", raw[:300])

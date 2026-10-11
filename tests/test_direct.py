@@ -46,7 +46,7 @@ class FakeGW:
         return {"chat_events": [ev(10, "旧消息")] + FakeGW.script[i]}
 
     def request(self, method, body=None, **kw):
-        assert method == "fs.read" and "offset" in body
+        assert method == "fs.read" and "len" in body
         FakeGW.reads.append(body["path"])
         return b'{"ok": true, "result": {"data": "UE5HREFUQQ==", "eof": true}}'
 

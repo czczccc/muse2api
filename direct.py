@@ -193,8 +193,8 @@ class DirectClient:
         chunk = 512 * 1024
         buf = b""
         while size is None or len(buf) < size:
-            raw = self.gw.request("fs.read", body={"path": path, "offset": len(buf), "length": chunk,
-                                                   "limit": chunk}, timeout=60)
+            raw = self.gw.request("fs.read", body={"path": path, "offset": len(buf), "len": chunk,
+                                                   }, timeout=60)
             part = raw
             try:
                 d = _json.loads(raw)
