@@ -11,13 +11,15 @@ from unittest.mock import patch
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
 
-import app
+import runner
+import state
+from engine import MuseGenerationError
 from config import Config
 from store import Store
 
 
 def test_concurrency_lock():
-    lock = app.ConcurrencyLock(limit=2)
+    lock = state.ConcurrencyLock(limit=2)
     assert not lock.locked()
 
     # 第一个槽位
@@ -57,7 +59,7 @@ def test_account_pool_manager():
         )
     )
 
-    pool = app.AccountPoolManager(dummy_store)
+    pool = state.AccountPoolManager(dummy_store)
 
     # 线程 1 占用 acc-1
     a1 = pool.acquire(timeout=0.5)
@@ -74,7 +76,7 @@ def test_account_pool_manager():
     try:
         pool.acquire(timeout=0.1)
         raise AssertionError("应抛出超时")
-    except app.MuseGenerationError:
+    except MuseGenerationError:
         pass
     assert time.monotonic() - t0 >= 0.08
 
@@ -98,7 +100,7 @@ def test_parallel_generation_simulation():
         {"id": "acc-1", "label": "A1", "enabled": True, "cookies": {"c": "1"}},
         {"id": "acc-2", "label": "A2", "enabled": True, "cookies": {"c": "2"}},
     ]
-    orig_accounts = list(app.store.accounts)
+    orig_accounts = list(state.store.accounts)
     running_threads = set()
     active_accounts = []
     concurrency_observed = False
@@ -119,16 +121,16 @@ def test_parallel_generation_simulation():
 
     try:
         with patch("store._write", lambda *a, **k: None), \
-             patch.object(app.store, "mark", lambda *a, **k: None), \
-             patch.object(app.engine, "start", return_value=None), \
-             patch.object(app.engine, "generate", side_effect=fake_generate), \
-             patch.object(app, "_renew_and_persist", return_value=None), \
-             patch.object(app, "_sync_cookies", return_value=None):
+             patch.object(state.store, "mark", lambda *a, **k: None), \
+             patch.object(state.engine, "start", return_value=None), \
+             patch.object(state.engine, "generate", side_effect=fake_generate), \
+             patch.object(runner, "_renew_and_persist", return_value=None), \
+             patch.object(runner, "_sync_cookies", return_value=None):
 
-            app.store.accounts = dummy_accounts
+            state.store.accounts = dummy_accounts
             results = []
             def run_task(p):
-                res = app._run_generation(p, "image", timeout=5)
+                res = runner._run_generation(p, "image", timeout=5)
                 results.append(res)
 
             t1 = threading.Thread(target=run_task, args=("task 1",), name="Worker-1")
@@ -142,9 +144,9 @@ def test_parallel_generation_simulation():
             assert len(results) == 2
             assert concurrency_observed, "两个任务应在独立的线程中同时并发执行！"
             assert set(r[1] for r in results) == {"acc-1", "acc-2"}, "两个任务应分别调度在两个独立账号上！"
-            assert len(app.ACCOUNT_POOL.busy_accounts) == 0, "任务结束后所有账号应彻底归还！"
+            assert len(state.ACCOUNT_POOL.busy_accounts) == 0, "任务结束后所有账号应彻底归还！"
     finally:
-        app.store.accounts = orig_accounts
+        state.store.accounts = orig_accounts
     print("PASS: test_parallel_generation_simulation")
 
 

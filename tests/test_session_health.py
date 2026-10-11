@@ -13,8 +13,12 @@ from unittest.mock import patch
 def check(root, home, observe):
     os.environ.update(MUSE2API_HOME=home, MUSE2API_PROFILE_ROOT=home, MUSE2API_KEY='test-only')
     sys.path.insert(0, str(root))
-    import app
+    import engine as engine_mod
+    import keepalive
     import requests
+    import routes_admin
+    import runner
+    import state
     checks = 0
 
     def expect(condition, message):
@@ -24,7 +28,7 @@ def check(root, home, observe):
             assert condition, message
 
     def account(prior=True, expiry=True):
-        a = app.store.add_account({'hatch_sess': 'fixture'}, cookies_exp={'hatch_vml': 1900012345} if expiry else {})
+        a = state.store.add_account({'hatch_sess': 'fixture'}, cookies_exp={'hatch_vml': 1900012345} if expiry else {})
         a.update(ok=prior, last_keepalive=1899999900, synced_at=1899999900)
         return a
 
@@ -49,7 +53,7 @@ def check(root, home, observe):
             a = account(prior)
             before = copy.deepcopy(a)
             with patch('requests.get', side_effect=reply if isinstance(reply, Exception) else None, return_value=reply) as get:
-                result = app._probe_account_sync(a['id'])
+                result = keepalive._probe_account_sync(a['id'])
             expected_ok = True if name == 'assigned' else False if name == '401' else prior
             expect(a['ok'] is expected_ok, f'{name}: account state changed incorrectly')
             expect(result['ok'] is (name == 'assigned'), f'{name}: wrong probe result')
@@ -72,8 +76,8 @@ def check(root, home, observe):
         auth_error = False
         with patch('requests.get', return_value=reply):
             try:
-                app._renew_and_persist(a['id'], force=True)
-            except app.MuseAuthError:
+                runner._renew_and_persist(a['id'], force=True)
+            except engine_mod.MuseAuthError:
                 auth_error = True
         expect(auth_error is (name == '401'), name + ': pre-renew wrong exception')
         expect(a['ok'] is (name != '401'), name + ': pre-renew wrong account state')
@@ -84,26 +88,26 @@ def check(root, home, observe):
     for prior in (True, None, False):
         a = account(prior)
         before = copy.deepcopy(a)
-        app.store.touch_keepalive(a['id'], None, 'fixture diagnostic')
+        state.store.touch_keepalive(a['id'], None, 'fixture diagnostic')
         expect(a['ok'] is prior and all(a[k] == before[k] for k in protected), 'unknown touch changed state')
     a = account(expiry=False)
     before_expiry = a['expires_at']
     with patch('time.time', return_value=1900003600):
-        app.store.touch_keepalive(a['id'], True)
+        state.store.touch_keepalive(a['id'], True)
     expect(a['expires_at'] == before_expiry, 'estimated expiry advanced without renewed cookie')
 
-    for error in (app.MuseAuthError('fixture auth'), app.MuseGenerationError('fixture loading')):
+    for error in (engine_mod.MuseAuthError('fixture auth'), engine_mod.MuseGenerationError('fixture loading')):
         for prior in (True, None, False):
             a = account(prior)
-            with patch.object(app.engine, 'start'), patch.object(app.engine, 'refresh', side_effect=error):
-                asyncio.run(app.test_account(a['id']))
-            want = False if isinstance(error, app.MuseAuthError) else prior
+            with patch.object(state.engine, 'start'), patch.object(state.engine, 'refresh', side_effect=error):
+                asyncio.run(routes_admin.test_account(a['id']))
+            want = False if isinstance(error, engine_mod.MuseAuthError) else prior
             expect(a['ok'] is want, 'manual test misclassified account')
 
     for body, want in [('loading workspace', 'MuseGenerationError'), ('Sign in', 'MuseAuthError')]:
         page = SimpleNamespace(js=lambda script: body if 'innerText' in script else False,
                                send=lambda *a, **k: None, close=lambda: None)
-        e = app.MuseEngine(SimpleNamespace(profile_dir=home, login_wait=0))
+        e = engine_mod.MuseEngine(SimpleNamespace(profile_dir=home, login_wait=0))
         reply = next(r for n, r in cases if n == 'assigned')
         with patch.object(e, '_open_page', return_value=page), patch.object(e, '_apply_cookies'), patch('requests.get', return_value=reply):
             try:

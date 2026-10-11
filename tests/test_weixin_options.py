@@ -7,19 +7,21 @@ from pathlib import Path
 os.environ["MUSE2API_HOME"] = tempfile.mkdtemp()
 os.environ["MUSE2API_KEY"] = "k"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import app  # noqa: E402
+import runner  # noqa: E402,F401
+import state  # noqa: E402
+import wx_bridge  # noqa: E402
 
 OPTS = ["全部删除（保留当前聊天）", "只删打招呼/测试的，保留作品记录", "先归档，手动再决定"]
 TEXT = "现在左侧有 45 个旁聊。\n\n想怎么处理？\n\n" + " ".join(OPTS)
 
 
 def test_format_and_resolve():
-    out = app.wx_format_options(TEXT, OPTS)
+    out = wx_bridge.wx_format_options(TEXT, OPTS)
     assert "1. 全部删除（保留当前聊天）" in out and "3. 先归档，手动再决定" in out
     assert out.count("先归档") == 1  # 拼成一行的原文被去掉了
-    assert app.wx_resolve_option("3", OPTS) == OPTS[2]
-    assert app.wx_resolve_option("9", OPTS) == "9"
-    assert app.wx_resolve_option("全归档", OPTS) == "全归档"
+    assert wx_bridge.wx_resolve_option("3", OPTS) == OPTS[2]
+    assert wx_bridge.wx_resolve_option("9", OPTS) == "9"
+    assert wx_bridge.wx_resolve_option("全归档", OPTS) == "全归档"
 
 
 def test_chat_uses_main_chat_and_options():
@@ -31,12 +33,12 @@ def test_chat_uses_main_chat_and_options():
         yield TEXT
         on_options(OPTS)
 
-    app.safe_chat_stream = fake_stream
-    app.store.pick_account = lambda **k: {"id": "a", "cookies": {}, "cookies_exp": None}
-    out = app._wx_chat("u", "整理旁聊")
+    wx_bridge.safe_chat_stream = fake_stream
+    state.store.pick_account = lambda **k: {"id": "a", "cookies": {}, "cookies_exp": None}
+    out = wx_bridge._wx_chat("u", "整理旁聊")
     assert seen["prompt"] == "整理旁聊" and seen["main"] is True and "整理旁聊" in seen["fb"]
     assert out[0][0] == "text" and "2. 只删打招呼" in out[0][1]
-    app._wx_chat("u", "2")
+    wx_bridge._wx_chat("u", "2")
     assert seen["prompt"] == OPTS[1]
 
 
@@ -45,12 +47,12 @@ def test_turn_replies_keep_order_files_and_code():
             {"k": "f", "name": "hello_world.py", "idx": 0, "data": b'print("hi")\n'},
             {"k": "f", "name": "bad/名字?.txt", "idx": 1, "data": None},
             {"k": "t", "v": "内容：\n```python\nprint('hi')\n```"}]
-    r = app.wx_turn_replies(turn, [])
+    r = wx_bridge.wx_turn_replies(turn, [])
     assert [x[0] for x in r] == ["text", "media", "text", "text"], r
     assert r[1][2] == "file" and open(r[1][1], "rb").read() == b'print("hi")\n'
     assert r[1][1].endswith("hello_world.py")
     assert "没能取回" in r[2][1] and "```python\nprint('hi')\n```" in r[3][1]
-    r = app.wx_turn_replies(turn, ["A", "B"])
+    r = wx_bridge.wx_turn_replies(turn, ["A", "B"])
     assert r[-1][1].endswith("回复数字选择，或直接回复文字。") and "1. A" in r[-1][1]
 
 
@@ -61,7 +63,7 @@ def test_permission_prompt_roundtrip():
     res = {}
 
     def ask():
-        res["idx"] = app.wx_ask_permission("u", "允许 Muse 删除 45 个聊天？", ["允许", "拒绝"],
+        res["idx"] = wx_bridge.wx_ask_permission("u", "允许 Muse 删除 45 个聊天？", ["允许", "拒绝"],
                                            push=lambda u, m: pushed.append(m), timeout=5)
     th = threading.Thread(target=ask)
     th.start()
@@ -70,13 +72,13 @@ def test_permission_prompt_roundtrip():
             break
         time.sleep(0.05)
     assert "1. 允许" in pushed[0] and "2. 拒绝" in pushed[0]
-    assert "请回复" in app.wx_answer_prompt("u", "abc")      # 听不懂不会解除等待
-    assert app.wx_answer_prompt("u", "1").startswith("已选择")
+    assert "请回复" in wx_bridge.wx_answer_prompt("u", "abc")      # 听不懂不会解除等待
+    assert wx_bridge.wx_answer_prompt("u", "1").startswith("已选择")
     th.join(3)
     assert res["idx"] == 0
-    assert app.wx_answer_prompt("u", "1") is None            # 已结束，不再拦截普通消息
+    assert wx_bridge.wx_answer_prompt("u", "1") is None            # 已结束，不再拦截普通消息
     # 超时返回 None
-    assert app.wx_ask_permission("u", "x", ["允许", "拒绝"], push=lambda u, m: None, timeout=0.1) is None
+    assert wx_bridge.wx_ask_permission("u", "x", ["允许", "拒绝"], push=lambda u, m: None, timeout=0.1) is None
 
 
 def test_engine_dialog_handling():
@@ -129,8 +131,8 @@ def test_same_user_messages_are_serialized():
         time.sleep(0.2)
         order.append(("end", text))
         return []
-    app._wx_handle_locked = slow
-    ts = [threading.Thread(target=app._wx_handle, args=("u", t)) for t in ("a", "b")]
+    wx_bridge._wx_handle_locked = slow
+    ts = [threading.Thread(target=wx_bridge._wx_handle, args=("u", t)) for t in ("a", "b")]
     for t in ts:
         t.start()
         time.sleep(0.05)
