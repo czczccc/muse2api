@@ -1120,7 +1120,7 @@ class MuseEngine:
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
-        "var nonEmpty=bs.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
+        "var nonEmpty=bs.filter(function(b){var t=(b.innerText||'').trim();return t.length>0&&!/^[^\\w\\u4e00-\\u9fff]{0,4}(小贴士|贴士|Tip)\\s*\\d*\\s*[:：]/i.test(t);});"
         "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"
         "var stop=!!(document.querySelector('[data-testid=\"hatch-composer-stop-button\"]')"
         "||document.querySelector('button[aria-label*=\"Stop\" i]')"
@@ -1152,7 +1152,7 @@ class MuseEngine:
         "(function(){"
         "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
         "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
-        ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'')&&((b.innerText||'').trim().length>0);});"
+        ".filter(function(b){var t=(b.innerText||'').trim();return /hatch-agent-bubble-bg/.test(b.className||'')&&t.length>0&&!/^[^\\w\\u4e00-\\u9fff]{0,4}(小贴士|贴士|Tip)\\s*\\d*\\s*[:：]/i.test(t);});"
         "var last=bs[bs.length-1];var out=[],picked=[];if(!last)return '[]';"
         "var els=last.querySelectorAll('button,[role=\"button\"],a,div,span');"
         "for(var i=0;i<els.length;i++){var el=els[i];"
@@ -1308,7 +1308,7 @@ class MuseEngine:
           items.push({k:'f',name:nameOf(u),idx:allAtt.indexOf(u)});
         }else if(!u.closest(ATT)){
           var t=conv(u).replace(/\n{3,}/g,NL+NL).trim();
-          if(t) items.push({k:'t',v:t});
+          if(t&&!/^[^\w\u4e00-\u9fff]{0,4}(小贴士|贴士|Tip)\s*\d*\s*[:：]/i.test(t)) items.push({k:'t',v:t});
         }
       }
       return JSON.stringify(items);
