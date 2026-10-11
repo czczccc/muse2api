@@ -9,3 +9,4 @@ cryptography>=42
 curl_cffi>=0.11
 noiseprotocol>=0.3
 protobuf>=5.0
+Pillow>=10

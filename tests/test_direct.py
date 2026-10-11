@@ -30,6 +30,8 @@ class FakeGW:
         self.n = 0
 
     def call_json(self, method, body=None, **kw):
+        if method == "fs.stat":
+            return {"size": 7}
         if method == "egress.approvals":
             return FakeGW.approvals
         if method == "egress.approval.decide":
@@ -44,9 +46,9 @@ class FakeGW:
         return {"chat_events": [ev(10, "旧消息")] + FakeGW.script[i]}
 
     def request(self, method, body=None, **kw):
-        assert method == "fs.read"
+        assert method == "fs.read" and "offset" in body
         FakeGW.reads.append(body["path"])
-        return b'{"content_base64": "UE5HREFUQQ=="}'
+        return b'{"ok": true, "result": {"data": "UE5HREFUQQ==", "eof": true}}'
 
     def _open(self, method, body=None, **kw):
         FakeGW.opened.append((method, body))

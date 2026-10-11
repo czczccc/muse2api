@@ -50,12 +50,11 @@ else:
     m = direct._presentation_media(direct._payload(pres[-1]))[0]
     p = m["path"]
     print("path =", p, "| url =", (m.get("alt_url") or "")[:80])
-    for meth, body in (("fs.read", {"path": p}), ("fs.read", {"path": "/" + p}),
-                       ("fs.read", {"path": p, "encoding": "base64"}), ("fs.reads", {"paths": [p]}),
-                       ("fs.stat", {"path": p}), ("fs.export", {"path": p})):
+    for meth, body in (("fs.read", {"path": p, "offset": 0, "length": 64, "limit": 64}),
+                       ("fs.read", {"path": p, "offset": 0})):
         try:
             raw = c.gw.request(meth, body=body, timeout=30)
-            print(meth, body, "-> OK", len(raw), "字节，开头:", raw[:160])
+            print(meth, body, "-> OK", len(raw), "字节，开头:", raw[:300])
         except Exception as exc:  # noqa: BLE001
             print(meth, body, "-> 失败:", str(exc)[:300])
     from curl_cffi import requests as rq
@@ -71,3 +70,5 @@ else:
                 print("GET", name, "->", r.status_code, r.headers.get("content-type"), len(r.content))
             except Exception as exc:  # noqa: BLE001
                 print("GET", name, "-> 失败:", str(exc)[:200])
+    data, mime = c._fs_read(p)
+    print("_fs_read 结果:", len(data or b""), "字节", mime, (data or b"")[:16])

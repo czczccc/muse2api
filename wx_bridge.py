@@ -206,6 +206,14 @@ def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
         if it[0] == "text":
             return ("text", it[1])
         _, data, kind, name = it
+        if kind == "image" and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            try:   # 微信不一定收 webp，转成 png
+                from PIL import Image
+                buf = io.BytesIO()
+                Image.open(io.BytesIO(data)).save(buf, "PNG")
+                data, name = buf.getvalue(), os.path.splitext(name or "image")[0] + ".png"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("webp 转 png 失败，按原图发送: %s", exc)
         ext = {"image": ".png", "video": ".mp4"}.get(kind, "")
         d = os.path.join(CFG.download_dir, "wx")
         os.makedirs(d, exist_ok=True)

@@ -176,32 +176,50 @@ class DirectClient:
         on_message(it)
 
     def _fs_read(self, path: str) -> tuple[bytes | None, str]:
-        """用网关的 fs.read 读 VM 里的文件（生成的图片/文件都在 workspace/ 下）。"""
+        """用网关的 fs.read 分段读 VM 里的文件（生成的图片/文件都在 workspace/ 下）。
+        fs.read 必须带 offset；返回格式按 JSON(base64) 或原始字节两种情况处理。"""
         import base64
         import json as _json
-        raw = self.gw.request("fs.read", body={"path": path}, timeout=60)
         mime = "image/png" if path.lower().endswith(".png") else \
             "image/jpeg" if re.search(r"\.jpe?g$", path, re.I) else \
             "image/webp" if path.lower().endswith(".webp") else \
             "video/mp4" if path.lower().endswith(".mp4") else ""
+        size = None
         try:
-            d = _json.loads(raw)
-        except ValueError:
-            return (raw or None), mime
-        if isinstance(d, dict):
-            d = d.get("result", d)
-            for k in ("content_base64", "data_base64", "base64", "content", "data", "bytes"):
-                v = d.get(k) if isinstance(d, dict) else None
-                if isinstance(v, str) and v:
-                    enc = (d.get("encoding") or "").lower()
-                    if "base64" in k or enc == "base64" or not enc:
-                        try:
-                            return base64.b64decode(v), d.get("mime_type") or mime
-                        except Exception:  # noqa: BLE001
-                            return v.encode(), d.get("mime_type") or mime
-                    return v.encode(), d.get("mime_type") or mime
-        log.warning("fs.read 返回无法识别：%s", str(d)[:300])
-        return None, ""
+            st = self.gw.call_json("fs.stat", body={"path": path})
+            size = int(st.get("size")) if isinstance(st, dict) and st.get("size") is not None else None
+        except Exception:  # noqa: BLE001
+            pass
+        chunk = 512 * 1024
+        buf = b""
+        while size is None or len(buf) < size:
+            raw = self.gw.request("fs.read", body={"path": path, "offset": len(buf), "length": chunk,
+                                                   "limit": chunk}, timeout=60)
+            part = raw
+            try:
+                d = _json.loads(raw)
+            except ValueError:
+                d = None
+            if isinstance(d, dict):
+                d = d.get("result", d)
+                v = next((d[k] for k in ("content_base64", "data_base64", "base64", "data", "content", "bytes")
+                          if isinstance(d.get(k), str)), None) if isinstance(d, dict) else None
+                if v is None:
+                    log.warning("fs.read 返回无法识别：%s", str(d)[:300])
+                    return None, ""
+                enc = str(d.get("encoding") or "").lower()
+                part = v.encode("latin-1") if enc in ("utf8", "utf-8", "text") else base64.b64decode(v)
+                if size is None and d.get("size") is not None:
+                    size = int(d["size"])
+                if d.get("eof") is True:
+                    buf += part
+                    break
+            if not part:
+                break
+            buf += part
+            if size is None and len(part) < chunk:
+                break
+        return (buf or None), mime
 
     def _check_approvals(self, seen: set, on_prompt):
         try:
