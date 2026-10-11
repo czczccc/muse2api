@@ -22,8 +22,8 @@ from engine import MuseEngine  # noqa: E402
 from store import Store  # noqa: E402
 
 SECRET_HDR = re.compile(r"cookie|authorization|token|auth|session|csrf", re.I)
-SECRET_VAL = re.compile(r"(hatch_[a-z_]+=)[^;\s\"']+|(Bearer\s+)[A-Za-z0-9._\-]+", re.I)
-SKIP_URL = re.compile(r"\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|css|map)(\?|$)|/_next/static/|google|doubleclick|facebook", re.I)
+SECRET_VAL = re.compile(r"(hatch_[a-z_]+=|auth_token=|notary_token=|[?&]token=)[^;&\s\"']+|(Bearer\s+)[A-Za-z0-9._\-]+", re.I)
+SKIP_URL = re.compile(r"^(data|blob):|\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|css|map)(\?|$)|/_next/static/|google|doubleclick|facebook", re.I)
 
 
 def scrub(text, limit=3000):
@@ -86,7 +86,7 @@ def main():
         elif m == "Network.webSocketCreated":
             write({"t": t, "type": "ws_open", "id": p.get("requestId"), "url": scrub(p.get("url"), 500)})
             print(f"  [{t:5.1f}s] WS     {scrub((p.get('url') or '').split('?')[0], 150)}", flush=True)
-            summary.append(("WS", p.get("url", ""), "open"))
+            summary.append(("WS", scrub((p.get("url") or "").split("?")[0], 200), "open"))
         elif m in ("Network.webSocketFrameSent", "Network.webSocketFrameReceived"):
             d = (p.get("response") or {})
             write({"t": t, "type": "ws_send" if m.endswith("Sent") else "ws_recv", "id": p.get("requestId"),
