@@ -17,7 +17,6 @@ from state import log
 MAX_AGE = 20 * 60        # 连接复用的最长时间；hatch token 会过期，到点重连
 POLL = 0.6               # 轮询历史的间隔
 QUIET = 4.0              # 最后一条回复之后静默多久就认为这一轮结束
-# 带图片/文件/视频的请求仍走浏览器：直连里附件怎么表示还没验证过
 NEEDS_BROWSER = re.compile(r"图|画|照片|海报|视频|文件|导出|下载|image|picture|photo|video|draw|file|download", re.I)
 
 
@@ -53,7 +52,33 @@ def is_reply(ev: dict, baseline: int) -> bool:
 
 def _has_attachment(ev: dict) -> bool:
     return any(v for k, v in _payload(ev).items()
-               if re.search(r"attach|media|file|image|video", k, re.I))
+               if re.search(r"attach|media|file|image|video|artifact", k, re.I))
+
+
+def _find_media(obj, out=None) -> list[dict]:
+    """在回复记录里找附件：带 http(s) 链接，或带 artifact/handle id 的字典。字段名还没实测，尽量宽松。"""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        url = next((obj[k] for k in ("url", "signed_url", "download_url", "src", "uri")
+                    if isinstance(obj.get(k), str) and obj[k].startswith("http")), None)
+        aid = next((obj[k] for k in ("artifact_id", "artifactId", "handle", "file_id")
+                    if isinstance(obj.get(k), str)), None)
+        if url or aid:
+            out.append({"url": url, "artifact_id": aid,
+                        "name": obj.get("name") or obj.get("filename") or obj.get("title") or "",
+                        "mime": obj.get("mime_type") or obj.get("mimeType") or obj.get("content_type") or ""})
+            return out
+        for v in obj.values():
+            _find_media(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _find_media(v, out)
+    return out
+
+
+APPROVAL_BUTTONS = ["允许一次", "总是允许此站点", "拒绝"]
+# 授权决定的取值还没实测，按常见写法；失败会把服务端返回写进日志
+APPROVAL_DECISIONS = ["allow_once", "allow_always", "deny"]
 
 
 class DirectClient:
@@ -90,8 +115,55 @@ class DirectClient:
         d = self.gw.call_json("chat.history", body={"limit": limit})
         return sorted(d.get("chat_events", []) if isinstance(d, dict) else [], key=lambda e: e.get("seq", 0))
 
-    def turn(self, cookies: dict, text: str, timeout: float, on_message) -> list[str]:
-        """发一条消息到主要聊天，回复每完成一条就调用 on_message(text)；返回全部回复文字。"""
+    def _fetch_media(self, m: dict) -> tuple[bytes | None, str]:
+        from curl_cffi import requests as rq
+        url = m.get("url")
+        try:
+            if not url and m.get("artifact_id"):
+                d = self.gw.call_json("artifacts.fetch_url", body={"artifact_id": m["artifact_id"]})
+                url = (d.get("url") if isinstance(d, dict) else d) or None
+                if not isinstance(url, str):
+                    log.info("artifacts.fetch_url 返回：%s", str(d)[:300])
+                    return None, ""
+            r = rq.get(url, headers={"Cookie": self.cookie, "Referer": "https://muse.ai/"},
+                       impersonate="chrome", timeout=60)
+            if r.status_code == 200 and r.content:
+                return r.content, r.headers.get("content-type", "")
+            log.warning("取附件失败 %s：%s", r.status_code, url[:80])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("取附件失败：%s", str(exc)[:160])
+        return None, ""
+
+    def _check_approvals(self, seen: set, on_prompt):
+        try:
+            d = self.gw.call_json("egress.approvals")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("读取授权请求失败: %s", exc)
+            return
+        items = d if isinstance(d, list) else (d.get("approvals") or d.get("items") or []) if isinstance(d, dict) else []
+        for a in items:
+            if not isinstance(a, dict):
+                continue
+            aid = a.get("approval_id") or a.get("id")
+            if not aid or aid in seen or a.get("status") not in (None, "pending", "PENDING"):
+                continue
+            seen.add(aid)
+            log.info("直连授权请求：%s", str(a)[:400])
+            host = a.get("host") or a.get("destination") or a.get("domain") or a.get("target") or ""
+            desc = a.get("description") or a.get("reason") or a.get("summary") or ""
+            txt = (f"允许 Muse 与 {host} 分享信息？\n{desc}").strip()
+            idx = on_prompt(txt, APPROVAL_BUTTONS) if on_prompt else None
+            decision = APPROVAL_DECISIONS[idx if idx is not None else 2]
+            try:
+                r = self.gw.call_json("egress.approval.decide", path_params={"approval_id": aid},
+                                      body={"decision": decision})
+                log.info("授权已提交 %s：%s", decision, str(r)[:200])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("提交授权失败（%s）：%s", decision, str(exc)[:300])
+
+    def turn(self, cookies: dict, text: str, timeout: float, on_message, on_prompt=None) -> list:
+        """发一条消息到主要聊天，回复每完成一条就调用 on_message(item)；item 为 ("text", s)
+        或 ("media", bytes, kind, name)。返回全部 item。"""
         with self.lock:
             t0 = time.time()
             try:
@@ -109,6 +181,8 @@ class DirectClient:
             deadline = t0 + timeout
             last_new = None
             first_logged = False
+            approvals: set = set()
+            last_appr = 0.0
             while True:
                 now = time.time()
                 if not out and now > deadline:
@@ -116,6 +190,11 @@ class DirectClient:
                 if out and now > deadline + 60:
                     break
                 time.sleep(POLL)
+                if time.time() - last_appr > 1.5:
+                    last_appr = time.time()
+                    t_a = time.time()
+                    self._check_approvals(approvals, on_prompt)
+                    deadline += time.time() - t_a       # 等用户回授权的时间不算超时
                 try:
                     evs = self._history(15)
                 except Exception as exc:  # noqa: BLE001
@@ -137,16 +216,28 @@ class DirectClient:
                         if seq in delivered:
                             continue
                         delivered.add(seq)
-                        t = _text(ev)
-                        if _has_attachment(ev):
-                            log.info("直连回复带附件字段：%s", sorted(_payload(ev).keys()))
-                            t += "\n（这条回复带附件，请到 muse.ai 页面查看）"
                         if not first_logged:
                             log.info("直连：首条回复 %.1fs", time.time() - t0)
                             first_logged = True
-                        out.append(t)
+                        items = [("text", _text(ev))]
+                        media = _find_media(_payload(ev))
+                        if _has_attachment(ev) or media:
+                            log.info("直连回复附件：%s", str({k: v for k, v in _payload(ev).items()
+                                                            if k not in ("display_text", "content")})[:800])
+                        for m in media:
+                            data, mime = self._fetch_media(m)
+                            mime = mime or m.get("mime") or ""
+                            kind = "image" if mime.startswith("image") else "video" if mime.startswith("video") else "file"
+                            if data:
+                                items.append(("media", data, kind, m.get("name") or ""))
+                            else:
+                                items.append(("text", "（附件没能取回，请到 muse.ai 页面查看）"))
+                        if not media and _has_attachment(ev):
+                            items.append(("text", "（这条回复带附件，暂时没能识别，请到 muse.ai 页面查看）"))
+                        for it in items:
+                            out.append(it)
+                            on_message(it)
                         last_new = time.time()
-                        on_message(t)
                     elif not (ev.get("reply_to_message_id") or _payload(ev).get("reply_to_message_id")) \
                             and _text(ev) and not _payload(ev).get("status"):
                         pending = True       # 还在写的回复，继续等

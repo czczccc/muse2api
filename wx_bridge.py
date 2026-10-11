@@ -197,25 +197,43 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
 
 
 def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
-    """直连网关发文字：每条助手回复完成就先发给微信，不开浏览器。"""
-    early: list[str] = []
-    rest: list[str] = []
+    """直连网关：每条助手回复（文字/图片/文件）完成就先发给微信，不开浏览器。"""
+    early: list = []
+    rest: list = []
     budget_ok = [emit is not None]
 
-    def on_message(t: str):
-        if budget_ok[0] and emit([("text", t)]) is not False:
-            early.append(t)
+    def to_reply(it):
+        if it[0] == "text":
+            return ("text", it[1])
+        _, data, kind, name = it
+        ext = {"image": ".png", "video": ".mp4"}.get(kind, "")
+        d = os.path.join(CFG.download_dir, "wx")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{uuid.uuid4().hex[:8]}_{_wx_safe_name(name) if name else 'file' + ext}")
+        if kind != "file" and not os.path.splitext(path)[1]:
+            path += ext
+        with open(path, "wb") as f:
+            f.write(data)
+        return ("media", path, kind)
+
+    def on_message(it):
+        r = to_reply(it)
+        if r[0] == "text" and not r[1]:
+            return
+        if budget_ok[0] and emit([r]) is not False:
+            early.append(r)
         else:
             budget_ok[0] = False          # 预算用完后的内容留到结束时合并发送
-            rest.append(t)
+            rest.append(r)
 
-    direct.get_client(acc["id"]).turn(acc["cookies"], text, CFG.chat_timeout, on_message)
-    texts = early + rest
+    direct.get_client(acc["id"]).turn(acc["cookies"], text, CFG.chat_timeout, on_message,
+                                      on_prompt=lambda t, b: wx_ask_permission(user, t, b))
+    texts = [r[1] for r in early + rest if r[0] == "text"]
     if texts:
         hist.append(ChatMessage(role="assistant", content="\n\n".join(texts)))
         del hist[:-12]
     if rest:
-        return [("text", t) for t in rest]
+        return rest
     return [] if early else [("text", "（没有收到回复，请稍后重试）")]
 
 

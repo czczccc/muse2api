@@ -20,6 +20,8 @@ def ev(seq, text, status="completed", reply_to="", name="message.assistant"):
 
 class FakeGW:
     opened = []
+    approvals = []
+    decided = []
     script = []          # 每次 history 调用依次返回的事件列表
 
     def __init__(self, cookie):
@@ -27,6 +29,12 @@ class FakeGW:
         self.n = 0
 
     def call_json(self, method, body=None, **kw):
+        if method == "egress.approvals":
+            return FakeGW.approvals
+        if method == "egress.approval.decide":
+            FakeGW.decided.append((kw.get("path_params"), body))
+            FakeGW.approvals = []
+            return {}
         assert method == "chat.history"
         if body.get("limit") == 1:
             return {"chat_events": [ev(10, "旧消息")]}
@@ -59,7 +67,7 @@ def test_turn_delivers_each_reply_once_and_skips_noise():
     c = direct.DirectClient("acc1")
     got = []
     out = c.turn({"hatch_sess": "x"}, "你好", 5, got.append)
-    assert out == got == ["你好呀", "第二段"], out
+    assert out == got == [("text", "你好呀"), ("text", "第二段")], out
     assert FakeGW.opened[0][0] == "chat.stream"
     assert FakeGW.opened[0][1]["items"] == [{"type": "text", "text": "你好"}]
 
@@ -89,3 +97,20 @@ def test_wx_chat_direct_emits_early():
     assert [x[1] for x in r] == ["第一段", "第二段"], r
     # 要图的请求不走直连
     assert direct.NEEDS_BROWSER.search("帮我画一只猫") and not direct.NEEDS_BROWSER.search("你好")
+
+
+def test_approval_is_forwarded_and_decided():
+    FakeGW.script = [[ev(11, "好了")]]
+    FakeGW.approvals = [{"id": "ap1", "status": "pending", "host": "1.1.1.1"}]
+    FakeGW.decided = []
+    asked = []
+    c = direct.DirectClient("acc3")
+    c.turn({"a": "b"}, "ssh", 5, lambda t: None,
+           on_prompt=lambda t, b: (asked.append((t, b)), 1)[1])
+    assert "1.1.1.1" in asked[0][0] and asked[0][1][1] == "总是允许此站点"
+    assert FakeGW.decided == [({"approval_id": "ap1"}, {"decision": "allow_always"})]
+
+
+def test_find_media():
+    p = {"display_text": "图", "attachments": [{"url": "https://x/y.png", "mime_type": "image/png", "name": "y.png"}]}
+    assert direct._find_media(p) == [{"url": "https://x/y.png", "artifact_id": None, "name": "y.png", "mime": "image/png"}]
