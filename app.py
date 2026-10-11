@@ -2428,11 +2428,12 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 # ------------------------- 微信 ClawBot 接入 -------------------------
 WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
-           "/重置：清空本地上下文（muse 主要聊天里的历史仍保留）\n/帮助：显示本说明")
+           "/重置：开始新话题（若接入的是 muse 主要聊天，其中的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
 
 
 _wx_options: dict[str, list[str]] = {}
+_wx_locks: dict[str, threading.Lock] = {}
 _wx_prompts: dict[str, dict] = {}   # 等待用户答复的授权弹窗：{event, buttons, answer}
 WX_PROMPT_TIMEOUT = 180
 
@@ -2521,8 +2522,13 @@ def _wx_chat(user: str, text: str) -> str:
 def _wx_handle(user: str, text: str) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
     answered = wx_answer_prompt(user, text)
-    if answered is not None:
+    if answered is not None:       # 回答授权弹窗不能被同一用户正在跑的任务挡住
         return [("text", answered)]
+    with _wx_locks.setdefault(user, threading.Lock()):   # 同一用户的消息按顺序处理
+        return _wx_handle_locked(user, text)
+
+
+def _wx_handle_locked(user: str, text: str) -> list:
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
@@ -2539,6 +2545,8 @@ def _wx_handle(user: str, text: str) -> list:
         return [("media", path, "video" if res.get("kind") == "video" else "image")]
     if text.strip() in ("/重置", "/reset", "/new"):
         _wx_history.pop(user, None)
+        _wx_options.pop(user, None)
+        engine.forget_chat_binding()
         return [("text", "已清空对话上下文。")]
     if text.strip() in ("/帮助", "/help", "/?"):
         return [("text", WX_HELP)]

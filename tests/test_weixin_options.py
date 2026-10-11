@@ -79,9 +79,57 @@ def test_engine_dialog_handling():
     assert clicked == [0, 1, 1, 1], clicked
 
 
+def test_enter_chat_binding():
+    import engine as E
+    eng = object.__new__(E.MuseEngine)
+    eng._chat_urls = {}
+    state = {"url": "https://muse.ai/thread/new", "main_ok": False, "navs": []}
+    eng._page_url = lambda: state["url"]
+    eng._navigate_ready = lambda u: state["navs"].append(u) or state.update(url=u) or True
+    eng.open_main_chat = lambda: state["main_ok"] and not state.update(url="https://muse.ai/") 
+    eng.reset_thread = lambda *a, **k: None
+    # 1) 找不到主要聊天：新会话，发带历史的提示词，发送后绑定 URL
+    p, fresh = eng._enter_chat("a1", "新消息", "历史+新消息")
+    assert (p, fresh) == ("历史+新消息", True)
+    state["url"] = "https://muse.ai/thread/abc"
+    eng._remember_thread("a1")
+    assert eng._chat_urls == {"a1": "https://muse.ai/thread/abc"}
+    # 2) 之后的消息：只发新消息，必要时导航回已绑定会话
+    state["url"] = "https://muse.ai/thread/new"
+    p, fresh = eng._enter_chat("a1", "第二条", "历史+第二条")
+    assert (p, fresh) == ("第二条", False) and state["navs"] == ["https://muse.ai/thread/abc"]
+    # 3) 重置后重新开始；主要聊天可用时记住它的 URL
+    eng.forget_chat_binding()
+    state["main_ok"] = True
+    p, fresh = eng._enter_chat("a1", "第三条", "历史+第三条")
+    assert (p, fresh) == ("第三条", False) and eng._chat_urls["a1"] == "https://muse.ai/"
+
+
+def test_same_user_messages_are_serialized():
+    import threading
+    import time
+    order = []
+
+    def slow(user, text):
+        order.append(("start", text))
+        time.sleep(0.2)
+        order.append(("end", text))
+        return []
+    app._wx_handle_locked = slow
+    ts = [threading.Thread(target=app._wx_handle, args=("u", t)) for t in ("a", "b")]
+    for t in ts:
+        t.start()
+        time.sleep(0.05)
+    for t in ts:
+        t.join()
+    assert [o[0] for o in order] == ["start", "end", "start", "end"], order
+
+
 if __name__ == "__main__":
     test_format_and_resolve()
     test_chat_uses_main_chat_and_options()
     test_permission_prompt_roundtrip()
     test_engine_dialog_handling()
+    test_enter_chat_binding()
+    test_same_user_messages_are_serialized()
     print("weixin options tests OK")

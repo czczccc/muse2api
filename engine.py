@@ -47,6 +47,7 @@ class MuseEngine:
         self.browser: CDP | None = None
         self._local = threading.local()
         self._start_lock = threading.Lock()
+        self._chat_urls: dict = {}
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
         self._last_http_renew: dict[str, float] = {}
@@ -186,6 +187,7 @@ class MuseEngine:
                 self._active_contexts.discard(ctx_id)
             self.current_context_id = None
         self.current_acc_id = None
+        self._chat_urls.clear()
 
     def _open_page(self):
         """为当前工作线程创建独立的页面。
@@ -419,11 +421,25 @@ class MuseEngine:
         try:
             clicked = self.page.js("""(function(){
                 var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
-                var els = document.querySelectorAll('a,button,[role="button"],[role="link"],div,span');
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    if (el.children.length > 1) continue;
-                    if (re.test(el.innerText || '')) { el.click(); return true; }
+                function clickable(el){
+                    var n = el;
+                    for (var k = 0; k < 6 && n; k++, n = n.parentElement) {
+                        if (n.tagName === 'A' || n.tagName === 'BUTTON' || n.getAttribute('role') === 'button'
+                            || n.getAttribute('role') === 'link' || getComputedStyle(n).cursor === 'pointer') return n;
+                    }
+                    return el;
+                }
+                var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                while (w.nextNode()) {
+                    if (re.test(w.currentNode.nodeValue || '')) {
+                        var el = w.currentNode.parentElement;
+                        if (el) { clickable(el).click(); return true; }
+                    }
+                }
+                var attrs = document.querySelectorAll('[aria-label],[title]');
+                for (var i = 0; i < attrs.length; i++) {
+                    var v = attrs[i].getAttribute('aria-label') || attrs[i].getAttribute('title') || '';
+                    if (re.test(v)) { clickable(attrs[i]).click(); return true; }
                 }
                 return false;
             })()""")
@@ -439,6 +455,75 @@ class MuseEngine:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _page_url(self) -> str:
+        try:
+            return (self.page.js("location.href") or "").split("#")[0]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _navigate_ready(self, url: str) -> bool:
+        self.page.send("Page.navigate", {"url": url})
+        t_end = time.time() + 12.0
+        while time.time() < t_end:
+            time.sleep(0.1)
+            try:
+                if self.page.js("document.readyState === 'complete' && !!document.querySelector('textarea')"):
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        self._wait_chat_loaded()
+        self._wait_ws_ready(self.page, timeout=12.0)
+        return bool(self.page.js("!!document.querySelector('textarea')"))
+
+    def _wait_chat_loaded(self, settle: float = 0.6, limit: float = 5.0):
+        """等历史气泡数连续 settle 秒不再变化，避免基线取在加载中途。"""
+        t_end, last, since = time.time() + limit, -1, time.time()
+        while time.time() < t_end:
+            try:
+                n = int(self.page.js("document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]').length") or 0)
+            except Exception:  # noqa: BLE001
+                return
+            if n != last:
+                last, since = n, time.time()
+            elif time.time() - since >= settle:
+                return
+            time.sleep(0.1)
+
+    def forget_chat_binding(self):
+        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）。"""
+        self._chat_urls.clear()
+
+    def _enter_chat(self, account_id, prompt: str, fallback_prompt: str | None):
+        """进入持续对话的会话，返回 (要发送的提示词, 是否新会话)。
+        顺序：已记住的会话 URL → 侧栏「主要聊天」→ 新会话（发带历史的提示词，发完记住 URL）。"""
+        key = account_id or "_"
+        url = self._chat_urls.get(key)
+        if url:
+            if self._page_url() == url or self._navigate_ready(url):
+                log.info("微信对话：沿用已绑定会话 %s", url)
+                return prompt, False
+            self._chat_urls.pop(key, None)
+        if self.open_main_chat():
+            u = self._page_url()
+            if u:
+                self._chat_urls[key] = u
+            log.info("微信对话：已进入主要聊天 %s", u)
+            return prompt, False
+        log.info("微信对话：找不到主要聊天入口，新建会话并在发送后绑定")
+        self.reset_thread(for_chat=True)
+        return (fallback_prompt or prompt), True
+
+    def _remember_thread(self, account_id):
+        """新会话发出消息后，页面会跳到 /thread/<id>，记住它供后续消息复用。"""
+        t_end = time.time() + 10.0
+        while time.time() < t_end:
+            u = self._page_url()
+            if "/thread/" in u and not u.rstrip("/").endswith("/thread/new"):
+                self._chat_urls[account_id or "_"] = u
+                log.info("微信对话：已绑定新会话 %s", u)
+                return
+            time.sleep(0.2)
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
@@ -1066,16 +1151,16 @@ class MuseEngine:
         进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
+        fresh = False
         if main_chat:
             self.reset_thread(for_chat=True, keep_page=True)
-            if not self.open_main_chat():
-                self.reset_thread(for_chat=True)
-                if fallback_prompt:
-                    prompt = fallback_prompt
+            prompt, fresh = self._enter_chat(account_id, prompt, fallback_prompt)
         else:
             self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
+        if main_chat and fresh:
+            self._remember_thread(account_id)
 
         t_sent = time.time()
         deadline = t_sent + timeout

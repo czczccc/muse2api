@@ -73,8 +73,8 @@ def test_login_and_chat():
                                msg(3, "me@im.wechat", "群里", group="g1")]]  # 群消息
         assert bot.poll_login()["status"] == "none"
         assert bot.status == "connected" and bot.allow_list() == ["me@im.wechat"]
-        for _ in range(60):
-            if FakeClient.sent:
+        for _ in range(100):
+            if FakeClient.sent and bot.state.get("updates_buf") == "B2":
                 break
             time.sleep(0.05)
         bot.stop()
