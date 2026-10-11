@@ -309,7 +309,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
-                     main_chat: bool = False, fallback_prompt: str | None = None):
+                     main_chat: bool = False, fallback_prompt: str | None = None,
+                     on_options=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -362,7 +363,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
-                            main_chat=main_chat, fallback_prompt=fallback_prompt
+                            main_chat=main_chat, fallback_prompt=fallback_prompt,
+                            on_options=on_options
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -2430,9 +2432,30 @@ WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 
 _wx_history: dict[str, list[ChatMessage]] = {}
 
 
+_wx_options: dict[str, list[str]] = {}
+
+
+def wx_format_options(text: str, opts: list[str]) -> str:
+    """把 muse 回复里的选项按钮渲染成编号列表（按钮文字在网页里会被拼成一行）。"""
+    idx = text.rfind(opts[0])
+    if idx > 0 and all(o in text[idx:] for o in opts):
+        text = text[:idx].rstrip()
+    lines = [f"{i}. {o}" for i, o in enumerate(opts, 1)]
+    return (text + "\n\n" if text else "") + "\n".join(lines) + "\n\n回复数字选择，或直接回复文字。"
+
+
+def wx_resolve_option(text: str, opts: list[str]) -> str:
+    """用户回数字 → 对应选项原文；其他输入原样发送。"""
+    t = text.strip()
+    if t.isdigit() and 1 <= int(t) <= len(opts):
+        return opts[int(t) - 1]
+    return text
+
+
 def _wx_chat(user: str, text: str) -> str:
     """微信对话走 muse.ai 的「主要聊天」：只发新消息，上下文由 muse 自己记。
     进不去主要聊天时，引擎会回退为新会话并改发带历史的 fallback_prompt。"""
+    text = wx_resolve_option(text, _wx_options.pop(user, []))
     hist = _wx_history.setdefault(user, [])
     hist.append(ChatMessage(role="user", content=text))
     del hist[:-12]
@@ -2440,12 +2463,17 @@ def _wx_chat(user: str, text: str) -> str:
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
+    opts: list[str] = []
     out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
                                    CFG.chat_timeout, account_id=acc["id"],
-                                   main_chat=True, fallback_prompt=fallback)).strip()
+                                   main_chat=True, fallback_prompt=fallback,
+                                   on_options=opts.extend)).strip()
     if out:
         hist.append(ChatMessage(role="assistant", content=out))
         del hist[:-12]
+    if opts:
+        _wx_options[user] = list(opts)
+        out = wx_format_options(out, opts)
     return out or "（没有收到回复，请稍后重试）"
 
 

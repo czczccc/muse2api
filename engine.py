@@ -959,6 +959,40 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return 0
 
+    # 最后一个助手气泡里的「选项按钮」（虚线框/按钮），用于在微信里编号呈现
+    _OPTIONS_JS = (
+        "(function(){"
+        "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
+        "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
+        ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'')&&((b.innerText||'').trim().length>0);});"
+        "var last=bs[bs.length-1];var out=[],picked=[];if(!last)return '[]';"
+        "var els=last.querySelectorAll('button,[role=\"button\"],a,div,span');"
+        "for(var i=0;i<els.length;i++){var el=els[i];"
+        "var t=(el.innerText||'').trim();if(!t||t.length>200)continue;"
+        "var isBtn=el.tagName==='BUTTON'||el.getAttribute('role')==='button';"
+        "var dashed=getComputedStyle(el).borderTopStyle==='dashed';"
+        "if(!isBtn&&!dashed)continue;"
+        "if(picked.some(function(p){return p.contains(el)||el.contains(p);}))continue;"
+        "picked.push(el);out.push(t.replace(/\\s+/g,' '));}"
+        "return JSON.stringify(out);})()"
+    )
+
+    def _poll_options(self) -> list[str]:
+        try:
+            raw = self.page.js(self._OPTIONS_JS)
+            opts = json.loads(raw) if raw else []
+            return [o for o in dict.fromkeys(opts) if o]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _report_options(self, on_options):
+        if on_options is None:
+            return
+        time.sleep(0.4)  # 选项按钮常比文字晚一拍渲染
+        opts = self._poll_options()
+        if opts:
+            on_options(opts)
+
     def _poll_chat(self) -> tuple[int, str, bool]:
         try:
             raw = self.page.js(self._POLL_CHAT_JS)
@@ -972,7 +1006,7 @@ class MuseEngine:
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, main_chat: bool = False,
-                    fallback_prompt: str | None = None):
+                    fallback_prompt: str | None = None, on_options=None):
         """发一条消息，流式 yield 增量文本。
 
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
@@ -1042,9 +1076,11 @@ class MuseEngine:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
+                    self._report_options(on_options)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= 80:
+                    self._report_options(on_options)
                     return
 
         raise MuseGenerationError("等待助手回复超时")
