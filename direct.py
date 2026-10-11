@@ -293,7 +293,9 @@ class DirectClient:
             b64 = base64.b64encode(chunk).decode()
             fill = {"data_base64": b64, "content_base64": b64, "offset": off, "len": len(chunk),
                     "encoding": "base64", "create_dirs": True, "mkdirs": True, "overwrite": off == 0,
-                    "truncate": off == 0, "append": off > 0}
+                    "truncate": off == 0, "append": off > 0, "create_parent": True,
+                    "create_parents": True, "parents": True, "mode": 0o644, "atomic": False,
+                    "sync": False, "fsync": False, "create": True, "exclusive": False}
             body = {k: fill[k] for k in fields} if fields else {"path": path, "data_base64": b64}
             body["path"] = path
             r = self._call_adaptive("fs.write", body, fill)
