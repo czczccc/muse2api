@@ -10,6 +10,7 @@ import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
+import direct
 from prompts import build_chat_prompt, build_image_prompt, build_video_prompt
 from runner import _run_generation, safe_chat_stream
 from schemas import ChatMessage, ImageRequest, VideoRequest
@@ -158,6 +159,11 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
         acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
         if not acc:
             raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
+    if direct.enabled() and not direct.NEEDS_BROWSER.search(text):
+        try:
+            return _wx_chat_direct(user, text, emit, acc, hist)
+        except direct.DirectNotSent as exc:     # 消息没发出去：退回浏览器方案
+            log.warning("直连不可用，退回浏览器：%s", str(exc)[:160])
     opts: list[str] = []
     turn: list[dict] = []
     early: list[dict] = []      # 生成过程中已经先发出去的气泡/附件
@@ -190,6 +196,29 @@ def _wx_chat(user: str, text: str, emit=None, acc_id: str | None = None) -> list
     if out:
         return [("text", wx_format_options(out, opts) if opts else out)]
     return [("text", "（没有收到回复，请稍后重试）")]
+
+
+def _wx_chat_direct(user: str, text: str, emit, acc: dict, hist: list) -> list:
+    """直连网关发文字：每条助手回复完成就先发给微信，不开浏览器。"""
+    early: list[str] = []
+    rest: list[str] = []
+    budget_ok = [emit is not None]
+
+    def on_message(t: str):
+        if budget_ok[0] and emit([("text", t)]) is not False:
+            early.append(t)
+        else:
+            budget_ok[0] = False          # 预算用完后的内容留到结束时合并发送
+            rest.append(t)
+
+    direct.get_client(acc["id"]).turn(acc["cookies"], text, CFG.chat_timeout, on_message)
+    texts = early + rest
+    if texts:
+        hist.append(ChatMessage(role="assistant", content="\n\n".join(texts)))
+        del hist[:-12]
+    if rest:
+        return [("text", t) for t in rest]
+    return [] if early else [("text", "（没有收到回复，请稍后重试）")]
 
 
 def _wx_handle(user: str, text: str, emit=None, acc_id: str | None = None) -> list:
@@ -283,6 +312,11 @@ def warm_wx(acc_id: str):
         acc = store.get_account(acc_id)
         if not acc or not acc.get("cookies"):
             return
+        if direct.enabled():
+            try:
+                direct.get_client(acc_id).warm(acc["cookies"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("直连网关预热失败（发消息时会重试）: %s", str(exc)[:160])
         engine.start()
         engine.prewarm_chat(acc["cookies"], acc.get("cookies_exp"), acc_id)
     except Exception as exc:  # noqa: BLE001
