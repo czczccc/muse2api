@@ -72,6 +72,7 @@ def main():
             hdr = {k: ("<redacted>" if SECRET_HDR.search(k) else scrub(v, 300))
                    for k, v in (r.get("headers") or {}).items()}
             reqs[p.get("requestId")] = {"url": url, "method": r.get("method")}
+            print(f"  [{t:5.1f}s] {r.get('method'):6} {scrub(url.split('?')[0], 150)}", flush=True)
             write({"t": t, "type": "request", "id": p.get("requestId"), "method": r.get("method"),
                    "url": scrub(url, 500), "headers": hdr, "body": scrub(r.get("postData")),
                    "resource": p.get("type")})
@@ -84,6 +85,7 @@ def main():
                        "mime": r.get("mimeType"), "url": scrub(r.get("url"), 500)})
         elif m == "Network.webSocketCreated":
             write({"t": t, "type": "ws_open", "id": p.get("requestId"), "url": scrub(p.get("url"), 500)})
+            print(f"  [{t:5.1f}s] WS     {scrub((p.get('url') or '').split('?')[0], 150)}", flush=True)
             summary.append(("WS", p.get("url", ""), "open"))
         elif m in ("Network.webSocketFrameSent", "Network.webSocketFrameReceived"):
             d = (p.get("response") or {})
@@ -97,9 +99,13 @@ def main():
     page.on_event = on_event
     page.send("Network.enable", {"maxPostDataSize": 20000})
     time.sleep(0.5)
-    print(f"账号 {acc.get('label') or acc['id']}，发送：{a.prompt}")
+    print(f"账号 {acc.get('label') or acc['id']}，发送：{a.prompt}", flush=True)
     engine._send(a.prompt)
-    page.pump(a.wait, on_event=on_event, sock_timeout=1.0)
+    print(f"已发送，继续记录 {a.wait} 秒（请求会实时打印在下面，结束后再出汇总）…", flush=True)
+    end = time.time() + a.wait
+    while time.time() < end:
+        page.pump(min(5.0, end - time.time()), on_event=on_event, sock_timeout=1.0)
+        print(f"  …还剩 {max(0, int(end - time.time()))} 秒，已记录 {len(reqs)} 个请求", flush=True)
     out.close()
     engine.close_current_page()
 
