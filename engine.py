@@ -368,13 +368,13 @@ class MuseEngine:
             time.sleep(0.08)
         return False
 
-    def reset_thread(self, for_chat: bool = False):
+    def reset_thread(self, for_chat: bool = False, keep_page: bool = False):
         """关闭残留弹窗并确保处于干净会话且 WebSocket 已就绪。
         对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。"""
         if not self.page:
             return
         try:
-            needs_nav = self.page.js("""(function(forChat){
+            needs_nav = self.page.js("""(function(forChat, keepPage){
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -389,11 +389,12 @@ class MuseEngine:
                 var bodyTxt = document.body ? (document.body.innerText || '') : '';
                 var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
                 if (hasStop || hasStuck || hasAtts) return true;
+                if (keepPage) return !document.querySelector('textarea');
                 if (forChat) {
                     return bubbleCount >= 24;
                 }
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
-            })(%s)""" % ("true" if for_chat else "false"))
+            })(%s, %s)""" % ("true" if for_chat else "false", "true" if keep_page else "false"))
             if needs_nav:
                 self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
                 t_end = time.time() + 10.0
@@ -409,6 +410,35 @@ class MuseEngine:
                 self._wait_ws_ready(self.page, timeout=12.0)
         except Exception:
             pass
+
+    def open_main_chat(self) -> bool:
+        """切到 muse.ai 左侧栏的「主要聊天」（持续会话，历史由 muse 自己保存）。
+        找不到入口返回 False，调用方应回退到「新会话 + 拼历史」的老办法。"""
+        if not self.page:
+            return False
+        try:
+            clicked = self.page.js("""(function(){
+                var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
+                var els = document.querySelectorAll('a,button,[role="button"],[role="link"],div,span');
+                for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (el.children.length > 1) continue;
+                    if (re.test(el.innerText || '')) { el.click(); return true; }
+                }
+                return false;
+            })()""")
+            if not clicked:
+                return False
+            t_end = time.time() + 10.0
+            while time.time() < t_end:
+                time.sleep(0.1)
+                if self.page.js("!!document.querySelector('textarea')"):
+                    break
+            time.sleep(0.6)
+            self._wait_ws_ready(self.page, timeout=12.0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
@@ -929,6 +959,92 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return 0
 
+    # 最后一个助手气泡里的「选项按钮」（虚线框/按钮），用于在微信里编号呈现
+    _OPTIONS_JS = (
+        "(function(){"
+        "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')||document.body;"
+        "var bs=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
+        ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'')&&((b.innerText||'').trim().length>0);});"
+        "var last=bs[bs.length-1];var out=[],picked=[];if(!last)return '[]';"
+        "var els=last.querySelectorAll('button,[role=\"button\"],a,div,span');"
+        "for(var i=0;i<els.length;i++){var el=els[i];"
+        "var t=(el.innerText||'').trim();if(!t||t.length>200)continue;"
+        "var isBtn=el.tagName==='BUTTON'||el.getAttribute('role')==='button';"
+        "var dashed=getComputedStyle(el).borderTopStyle==='dashed';"
+        "if(!isBtn&&!dashed)continue;"
+        "if(picked.some(function(p){return p.contains(el)||el.contains(p);}))continue;"
+        "picked.push(el);out.push(t.replace(/\\s+/g,' '));}"
+        "return JSON.stringify(out);})()"
+    )
+
+    def _poll_options(self) -> list[str]:
+        try:
+            raw = self.page.js(self._OPTIONS_JS)
+            opts = json.loads(raw) if raw else []
+            return [o for o in dict.fromkeys(opts) if o]
+        except Exception:  # noqa: BLE001
+            return []
+
+    # 页面上的授权/确认弹窗（role=dialog / alertdialog），返回正文和按钮文字
+    _DIALOG_JS = (
+        "(function(){"
+        "var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'))"
+        ".filter(function(d){var r=d.getBoundingClientRect();return r.width>0&&r.height>0;});"
+        "var d=ds[ds.length-1];if(!d)return '';"
+        "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]'))"
+        ".map(function(b){return (b.innerText||b.getAttribute('aria-label')||'').trim().replace(/\\s+/g,' ');})"
+        ".filter(function(t){return t&&t.length<80;});"
+        "if(!bs.length)return '';"
+        "var txt=(d.innerText||'').trim();"
+        "return JSON.stringify({text:txt.slice(0,600),buttons:bs});})()"
+    )
+    _DENY_RE = re.compile(r"拒绝|不允许|不同意|取消|^否$|\bdeny|\breject|\bdecline|\bcancel|^no$", re.I)
+
+    def _poll_dialog(self) -> dict | None:
+        try:
+            raw = self.page.js(self._DIALOG_JS)
+            return json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _click_dialog_button(self, idx: int) -> bool:
+        try:
+            return bool(self.page.js(
+                "(function(i){var ds=[].slice.call(document.querySelectorAll('[role=\"dialog\"],[role=\"alertdialog\"]'));"
+                "var d=ds[ds.length-1];if(!d)return false;"
+                "var bs=[].slice.call(d.querySelectorAll('button,[role=\"button\"]')).filter(function(b){"
+                "var t=(b.innerText||b.getAttribute('aria-label')||'').trim();return t&&t.length<80;});"
+                "if(!bs[i])return false;bs[i].click();return true;})(%d)" % int(idx)))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def handle_dialog(self, on_prompt) -> float:
+        """若页面弹出授权/确认窗，交给 on_prompt(text, buttons) 决定点哪个按钮（返回下标，
+        None=未答复）。未答复时点「拒绝」类按钮，找不到就点最后一个。返回等待耗时（秒）。"""
+        d = self._poll_dialog()
+        if not d:
+            return 0.0
+        t0 = time.time()
+        buttons = d["buttons"]
+        try:
+            idx = on_prompt(d["text"], buttons)
+        except Exception:  # noqa: BLE001
+            idx = None
+        if idx is None or not 0 <= idx < len(buttons):
+            denies = [i for i, b in enumerate(buttons) if self._DENY_RE.search(b)]
+            idx = denies[0] if denies else len(buttons) - 1
+        self._click_dialog_button(idx)
+        time.sleep(0.3)
+        return time.time() - t0
+
+    def _report_options(self, on_options):
+        if on_options is None:
+            return
+        time.sleep(0.4)  # 选项按钮常比文字晚一拍渲染
+        opts = self._poll_options()
+        if opts:
+            on_options(opts)
+
     def _poll_chat(self) -> tuple[int, str, bool]:
         try:
             raw = self.page.js(self._POLL_CHAT_JS)
@@ -941,11 +1057,23 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, main_chat: bool = False,
+                    fallback_prompt: str | None = None, on_options=None,
+                    on_prompt=None):
+        """发一条消息，流式 yield 增量文本。
+
+        main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
+        进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        if main_chat:
+            self.reset_thread(for_chat=True, keep_page=True)
+            if not self.open_main_chat():
+                self.reset_thread(for_chat=True)
+                if fallback_prompt:
+                    prompt = fallback_prompt
+        else:
+            self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
@@ -954,12 +1082,19 @@ class MuseEngine:
         first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable = "", None, 0
         got_first = False
+        last_dlg = [0.0]
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
+            if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
+                last_dlg[0] = time.time()
+                waited = self.handle_dialog(on_prompt)
+                if waited:
+                    deadline += waited
+                    first_token_deadline += waited
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
@@ -987,6 +1122,9 @@ class MuseEngine:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
+            if on_prompt is not None and time.time() - last_dlg[0] > 0.5:
+                last_dlg[0] = time.time()
+                deadline += self.handle_dialog(on_prompt)
             cnt, cur, has_stop = self._poll_chat()
             if not cur:
                 continue
@@ -1001,9 +1139,11 @@ class MuseEngine:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
+                    self._report_options(on_options)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= 80:
+                    self._report_options(on_options)
                     return
 
         raise MuseGenerationError("等待助手回复超时")

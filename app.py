@@ -308,7 +308,9 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     main_chat: bool = False, fallback_prompt: str | None = None,
+                     on_options=None, on_prompt=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -360,7 +362,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.start()
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            account_id=cur_id, stop_event=stop_event,
+                            main_chat=main_chat, fallback_prompt=fallback_prompt,
+                            on_options=on_options, on_prompt=on_prompt
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -2424,28 +2428,101 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 
 # ------------------------- 微信 ClawBot 接入 -------------------------
 WX_HELP = ("直接发文字即可对话。\n/画 描述：生成图片\n/视频 描述：生成视频（需要等一两分钟）\n"
-           "/重置：清空对话上下文\n/帮助：显示本说明")
+           "/重置：清空本地上下文（muse 主要聊天里的历史仍保留）\n/帮助：显示本说明")
 _wx_history: dict[str, list[ChatMessage]] = {}
 
 
+_wx_options: dict[str, list[str]] = {}
+_wx_prompts: dict[str, dict] = {}   # 等待用户答复的授权弹窗：{event, buttons, answer}
+WX_PROMPT_TIMEOUT = 180
+
+
+def wx_ask_permission(user: str, text: str, buttons: list[str], push=None,
+                      timeout: float = WX_PROMPT_TIMEOUT) -> int | None:
+    """muse.ai 弹出授权/确认窗：把正文和编号按钮发到微信，阻塞等用户回复，返回按钮下标。
+    超时返回 None（引擎会点「拒绝」类按钮）。"""
+    st = {"event": threading.Event(), "buttons": buttons, "answer": None}
+    _wx_prompts[user] = st
+    lines = [f"{i}. {b}" for i, b in enumerate(buttons, 1)]
+    msg = ("muse.ai 需要你确认：\n" + text.strip()[:500] + "\n\n" + "\n".join(lines)
+           + f"\n\n回复数字选择；{int(timeout)} 秒内没回复将自动拒绝。")
+    try:
+        (push or weixin.push_text)(user, msg)
+        st["event"].wait(timeout)
+    finally:
+        _wx_prompts.pop(user, None)
+    return st["answer"]
+
+
+def wx_answer_prompt(user: str, text: str) -> str | None:
+    """若该用户有待答复的弹窗，用这条消息作答并返回提示语；没有则返回 None。"""
+    st = _wx_prompts.get(user)
+    if not st:
+        return None
+    t = text.strip()
+    idx = None
+    if t.isdigit() and 1 <= int(t) <= len(st["buttons"]):
+        idx = int(t) - 1
+    else:
+        for i, b in enumerate(st["buttons"]):
+            if t and (t == b or t in b):
+                idx = i
+                break
+    if idx is None:
+        return f"请回复 1 到 {len(st['buttons'])} 之间的数字来选择。"
+    st["answer"] = idx
+    st["event"].set()
+    return f"已选择：{st['buttons'][idx]}"
+
+
+def wx_format_options(text: str, opts: list[str]) -> str:
+    """把 muse 回复里的选项按钮渲染成编号列表（按钮文字在网页里会被拼成一行）。"""
+    idx = text.rfind(opts[0])
+    if idx > 0 and all(o in text[idx:] for o in opts):
+        text = text[:idx].rstrip()
+    lines = [f"{i}. {o}" for i, o in enumerate(opts, 1)]
+    return (text + "\n\n" if text else "") + "\n".join(lines) + "\n\n回复数字选择，或直接回复文字。"
+
+
+def wx_resolve_option(text: str, opts: list[str]) -> str:
+    """用户回数字 → 对应选项原文；其他输入原样发送。"""
+    t = text.strip()
+    if t.isdigit() and 1 <= int(t) <= len(opts):
+        return opts[int(t) - 1]
+    return text
+
+
 def _wx_chat(user: str, text: str) -> str:
+    """微信对话走 muse.ai 的「主要聊天」：只发新消息，上下文由 muse 自己记。
+    进不去主要聊天时，引擎会回退为新会话并改发带历史的 fallback_prompt。"""
+    text = wx_resolve_option(text, _wx_options.pop(user, []))
     hist = _wx_history.setdefault(user, [])
     hist.append(ChatMessage(role="user", content=text))
     del hist[:-12]
-    prompt = build_chat_prompt(hist)
+    fallback = build_chat_prompt(hist)
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
         raise RuntimeError("没有可用账号，请先在管理页面导入 cookie")
-    out = "".join(safe_chat_stream(acc["cookies"], prompt, acc.get("cookies_exp"),
-                                   CFG.chat_timeout, account_id=acc["id"])).strip()
+    opts: list[str] = []
+    out = "".join(safe_chat_stream(acc["cookies"], text, acc.get("cookies_exp"),
+                                   CFG.chat_timeout, account_id=acc["id"],
+                                   main_chat=True, fallback_prompt=fallback,
+                                   on_options=opts.extend,
+                                   on_prompt=lambda t, b: wx_ask_permission(user, t, b))).strip()
     if out:
         hist.append(ChatMessage(role="assistant", content=out))
         del hist[:-12]
+    if opts:
+        _wx_options[user] = list(opts)
+        out = wx_format_options(out, opts)
     return out or "（没有收到回复，请稍后重试）"
 
 
 def _wx_handle(user: str, text: str) -> list:
     """微信私聊消息 → 回复列表：("text", s) 或 ("media", path, kind)。"""
+    answered = wx_answer_prompt(user, text)
+    if answered is not None:
+        return [("text", answered)]
     m = re.match(r"^/(画|图|image|img|视频|video)\s*(.*)$", text, re.S | re.I)
     if m:
         kind = "video" if m.group(1).lower() in ("视频", "video") else "image"
