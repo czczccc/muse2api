@@ -502,6 +502,13 @@ class MuseEngine:
                 return
             time.sleep(0.1)
 
+    def _close_dialog(self):
+        try:
+            self.page.js("""(function(){var d=document.querySelector('[role="dialog"]');
+                if(d){var b=d.querySelector('button[aria-label*="close" i], button'); if(b) b.click();}})()""")
+        except Exception:  # noqa: BLE001
+            pass
+
     def forget_chat_binding(self):
         """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）。"""
         self._chat_urls.clear()
@@ -537,7 +544,8 @@ class MuseEngine:
                 return
             time.sleep(0.2)
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None,
+                    start_url: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
             try:
                 if self.page.js("!!document.querySelector('textarea')"):
@@ -567,7 +575,7 @@ class MuseEngine:
 
         page = self._open_page()
         self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        page.send("Page.navigate", {"url": start_url or "https://muse.ai/thread/new"})
         for _ in range(self.cfg.login_wait * 2):
             time.sleep(0.15)
             try:
@@ -1309,21 +1317,21 @@ class MuseEngine:
                 out.append(it)
         return out
 
-    def _report_turn(self, on_turn, base, wait_media: bool = False):
+    def _report_turn(self, on_turn, base, wait_media: float = 0.0):
         """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。
-        wait_media=True（用户在要图/视频/文件）时，文字说完后附件可能还在生成，多等一会儿再取。"""
+        wait_media>0（用户在要图/视频/文件）时，文字说完后附件可能还在生成，最多再等这么多秒。"""
         if on_turn is None:
             return
         time.sleep(0.4)
         items = self._new_turn_items(base)
         if wait_media:
-            t_end = time.time() + 45.0
+            t_end = time.time() + wait_media
             stable_since = time.time()
             while time.time() < t_end:
                 has_media = any(i.get("k") in ("m", "f") for i in items)
-                if has_media and time.time() - stable_since >= 3.0:
+                if has_media and time.time() - stable_since >= 2.0:
                     break
-                time.sleep(1.0)
+                time.sleep(0.5)
                 cur = self._new_turn_items(base)
                 if len(cur) != len(items):
                     stable_since = time.time()
@@ -1377,19 +1385,36 @@ class MuseEngine:
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
         进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
+        t_begin = time.time()
+        bound = self._chat_urls.get(account_id or "_") if main_chat else None
+        try:
+            # 已绑定会话时直接以该会话地址开页，省掉先开 /thread/new 再跳转的一次整页加载
+            self.ensure_page(cookies, expires, account_id=account_id, start_url=bound)
+        except MuseGenerationError:
+            if not bound:
+                raise
+            log.info("微信对话：绑定的会话 %s 打不开，改用新会话", bound)
+            self._chat_urls.pop(account_id or "_", None)
+            self.ensure_page(cookies, expires, account_id=account_id)
+        t_page = time.time()
         fresh = False
         if main_chat:
-            self.reset_thread(for_chat=True, keep_page=True)
+            self._close_dialog()
             prompt, fresh = self._enter_chat(account_id, prompt, fallback_prompt)
         else:
             self.reset_thread(for_chat=True)
-        want_media = bool(re.search(r"图|画|照片|海报|视频|文件|生成|导出|下载|image|picture|photo|video|file|draw|generate",
-                                    prompt or "", re.I))
+        # 要图/视频：附件常在文字说完之后才出现，多等；只是提到文件/生成等词的，只短等一下，避免平白加延迟
+        if re.search(r"图|画|照片|海报|视频|image|picture|photo|video|draw", prompt or "", re.I):
+            want_media = 45.0
+        elif re.search(r"文件|生成|导出|下载|file|generate|export|download", prompt or "", re.I):
+            want_media = 5.0
+        else:
+            want_media = 0.0
         if on_turn is not None and main_chat:
             self._wait_chat_loaded()      # 历史分批加载，等稳定了再取基线
         base_agent, base_text, _ = self._poll_chat()
         base_turn = self._turn_baseline() if on_turn is not None else None
+        t_ready = time.time()
         self._send(prompt)
         if main_chat and fresh:
             self._remember_thread(account_id)
@@ -1427,6 +1452,8 @@ class MuseEngine:
             delta = cur[len(sent):] if cur.startswith(sent) else cur
             if delta:
                 sent = cur
+                log.info("对话耗时：开页 %.1fs、进会话+取基线 %.1fs、首字 %.1fs",
+                         t_page - t_begin, t_ready - t_page, time.time() - t_ready)
                 yield delta
                 last = cur
                 got_first = True
@@ -1461,6 +1488,7 @@ class MuseEngine:
                 if not has_stop and stable >= 3:
                     self._report_options(on_options)
                     self._report_turn(on_turn, base_turn, wait_media=want_media)
+                    log.info("对话耗时：从发送到结束共 %.1fs", time.time() - t_ready)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= (600 if on_turn is not None else 80):
