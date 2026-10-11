@@ -41,3 +41,33 @@ for m in ("egress.approvals", "artifacts.list"):
         print(json.dumps(c.gw.call_json(m), ensure_ascii=False)[:2000])
     except Exception as exc:  # noqa: BLE001
         print("失败:", exc)
+
+print("\n=== 取图测试（最近一张生成图）===")
+pres = [e for e in evs if e.get("event_name") == "delta.presentation"]
+if not pres:
+    print("最近没有生成图")
+else:
+    m = direct._presentation_media(direct._payload(pres[-1]))[0]
+    p = m["path"]
+    print("path =", p, "| url =", (m.get("alt_url") or "")[:80])
+    for meth, body in (("fs.read", {"path": p}), ("fs.read", {"path": "/" + p}),
+                       ("fs.read", {"path": p, "encoding": "base64"}), ("fs.reads", {"paths": [p]}),
+                       ("fs.stat", {"path": p}), ("fs.export", {"path": p})):
+        try:
+            raw = c.gw.request(meth, body=body, timeout=30)
+            print(meth, body, "-> OK", len(raw), "字节，开头:", raw[:160])
+        except Exception as exc:  # noqa: BLE001
+            print(meth, body, "-> 失败:", str(exc)[:300])
+    from curl_cffi import requests as rq
+    url = m.get("alt_url")
+    if url:
+        for name, h in (("cookie", {"Cookie": c.cookie}),
+                        ("hatch", {"Authorization": "Bearer " + c.gw.hatch_token}),
+                        ("access", {"Authorization": "Bearer " + c.gw.access_token}),
+                        ("hatch-query", None)):
+            try:
+                u = url + ("?auth_token=" + c.gw.hatch_token if h is None else "")
+                r = rq.get(u, headers={**(h or {}), "Referer": "https://muse.ai/"}, impersonate="chrome", timeout=30)
+                print("GET", name, "->", r.status_code, r.headers.get("content-type"), len(r.content))
+            except Exception as exc:  # noqa: BLE001
+                print("GET", name, "-> 失败:", str(exc)[:200])
