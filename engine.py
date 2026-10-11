@@ -47,6 +47,7 @@ class MuseEngine:
         self.browser: CDP | None = None
         self._local = threading.local()
         self._start_lock = threading.Lock()
+        self._chat_urls: dict = {}
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
         self._last_http_renew: dict[str, float] = {}
@@ -186,6 +187,7 @@ class MuseEngine:
                 self._active_contexts.discard(ctx_id)
             self.current_context_id = None
         self.current_acc_id = None
+        self._chat_urls.clear()
 
     def _open_page(self):
         """为当前工作线程创建独立的页面。
@@ -419,11 +421,25 @@ class MuseEngine:
         try:
             clicked = self.page.js("""(function(){
                 var re = /^\\s*(主要聊天|main chat|main)\\s*$/i;
-                var els = document.querySelectorAll('a,button,[role="button"],[role="link"],div,span');
-                for (var i = 0; i < els.length; i++) {
-                    var el = els[i];
-                    if (el.children.length > 1) continue;
-                    if (re.test(el.innerText || '')) { el.click(); return true; }
+                function clickable(el){
+                    var n = el;
+                    for (var k = 0; k < 6 && n; k++, n = n.parentElement) {
+                        if (n.tagName === 'A' || n.tagName === 'BUTTON' || n.getAttribute('role') === 'button'
+                            || n.getAttribute('role') === 'link' || getComputedStyle(n).cursor === 'pointer') return n;
+                    }
+                    return el;
+                }
+                var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                while (w.nextNode()) {
+                    if (re.test(w.currentNode.nodeValue || '')) {
+                        var el = w.currentNode.parentElement;
+                        if (el) { clickable(el).click(); return true; }
+                    }
+                }
+                var attrs = document.querySelectorAll('[aria-label],[title]');
+                for (var i = 0; i < attrs.length; i++) {
+                    var v = attrs[i].getAttribute('aria-label') || attrs[i].getAttribute('title') || '';
+                    if (re.test(v)) { clickable(attrs[i]).click(); return true; }
                 }
                 return false;
             })()""")
@@ -439,6 +455,75 @@ class MuseEngine:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    def _page_url(self) -> str:
+        try:
+            return (self.page.js("location.href") or "").split("#")[0]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _navigate_ready(self, url: str) -> bool:
+        self.page.send("Page.navigate", {"url": url})
+        t_end = time.time() + 12.0
+        while time.time() < t_end:
+            time.sleep(0.1)
+            try:
+                if self.page.js("document.readyState === 'complete' && !!document.querySelector('textarea')"):
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        self._wait_chat_loaded()
+        self._wait_ws_ready(self.page, timeout=12.0)
+        return bool(self.page.js("!!document.querySelector('textarea')"))
+
+    def _wait_chat_loaded(self, settle: float = 0.6, limit: float = 5.0):
+        """等历史气泡数连续 settle 秒不再变化，避免基线取在加载中途。"""
+        t_end, last, since = time.time() + limit, -1, time.time()
+        while time.time() < t_end:
+            try:
+                n = int(self.page.js("document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]').length") or 0)
+            except Exception:  # noqa: BLE001
+                return
+            if n != last:
+                last, since = n, time.time()
+            elif time.time() - since >= settle:
+                return
+            time.sleep(0.1)
+
+    def forget_chat_binding(self):
+        """清掉记住的对话会话，下一条微信消息会开新会话（/重置 用）。"""
+        self._chat_urls.clear()
+
+    def _enter_chat(self, account_id, prompt: str, fallback_prompt: str | None):
+        """进入持续对话的会话，返回 (要发送的提示词, 是否新会话)。
+        顺序：已记住的会话 URL → 侧栏「主要聊天」→ 新会话（发带历史的提示词，发完记住 URL）。"""
+        key = account_id or "_"
+        url = self._chat_urls.get(key)
+        if url:
+            if self._page_url() == url or self._navigate_ready(url):
+                log.info("微信对话：沿用已绑定会话 %s", url)
+                return prompt, False
+            self._chat_urls.pop(key, None)
+        if self.open_main_chat():
+            u = self._page_url()
+            if u:
+                self._chat_urls[key] = u
+            log.info("微信对话：已进入主要聊天 %s", u)
+            return prompt, False
+        log.info("微信对话：找不到主要聊天入口，新建会话并在发送后绑定")
+        self.reset_thread(for_chat=True)
+        return (fallback_prompt or prompt), True
+
+    def _remember_thread(self, account_id):
+        """新会话发出消息后，页面会跳到 /thread/<id>，记住它供后续消息复用。"""
+        t_end = time.time() + 10.0
+        while time.time() < t_end:
+            u = self._page_url()
+            if "/thread/" in u and not u.rstrip("/").endswith("/thread/new"):
+                self._chat_urls[account_id or "_"] = u
+                log.info("微信对话：已绑定新会话 %s", u)
+                return
+            time.sleep(0.2)
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
@@ -1037,6 +1122,152 @@ class MuseEngine:
         time.sleep(0.3)
         return time.time() - t0
 
+    # 一轮回复可能由多个气泡 + 文件卡片组成：按页面顺序取出 [{k:'t',v:文本} | {k:'f',name,idx}]，
+    # 文本里的代码块保留换行并用 ``` 围起来（innerText 会把它压成一行）。
+    _TURN_JS = r"""(function(){
+      var NL=String.fromCharCode(10);
+      var scope=document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]')||document.body;
+      var ATT='[data-testid^="hatch-chat-attachment-presentation-"]';
+      var LABEL=/^[A-Za-z0-9_+#.-]{1,20}$/;
+      function inUser(el){return !!el.closest('form,[class*="chat-user-bubble"]');}
+      function langOf(c){var m=/language-([A-Za-z0-9_+#-]+)/.exec((c&&c.className)||'');return m?m[1]:'';}
+      function codeInfo(el){
+        var pre=el.tagName==='PRE'?el:el.querySelector('pre');
+        var code=(pre&&pre.querySelector('code'))||pre||el;
+        var txt=(code.innerText||code.textContent||'').replace(/\s+$/,'');
+        return {pre:pre,code:code,txt:txt};
+      }
+      function isCodeWrapper(el){
+        if(el.tagName==='PRE') return true;
+        var pres=el.querySelectorAll('pre'); if(pres.length!==1) return false;
+        var ci=codeInfo(el);
+        var rest=(el.innerText||'').replace(ci.txt,'').trim();
+        var toks=rest.split(/\s+/).filter(Boolean);
+        return toks.length<=3&&toks.every(function(t){return LABEL.test(t);});
+      }
+      function fence(el){
+        var ci=codeInfo(el);
+        var lang=langOf(ci.code)||langOf(ci.pre);
+        if(!lang&&el!==ci.pre){
+          var first=(el.innerText||'').trim().split(NL)[0].trim();
+          if(LABEL.test(first)&&ci.txt.indexOf(first)!==0) lang=first;
+        }
+        return '```'+lang+NL+ci.txt+NL+'```';
+      }
+      function conv(node){
+        if(node.nodeType===3) return node.nodeValue;
+        if(node.nodeType!==1) return '';
+        var tag=node.tagName;
+        if(/^(BUTTON|svg|SVG|STYLE|SCRIPT)$/.test(tag)) return '';
+        if(node.matches&&node.matches(ATT)) return '';
+        if(isCodeWrapper(node)) return NL+fence(node)+NL;
+        if(tag==='BR') return NL;
+        var out='';
+        for(var c=node.firstChild;c;c=c.nextSibling) out+=conv(c);
+        if(tag==='LI') return '- '+out.trim()+NL;
+        if(tag==='CODE') return '`'+out+'`';
+        if(/^(P|DIV|UL|OL|H[1-6]|BLOCKQUOTE|TABLE|TR)$/.test(tag)) return NL+out.trim()+NL;
+        return out;
+      }
+      function nameOf(u){
+        var lines=(u.innerText||'').split(NL).map(function(s){return s.trim();}).filter(Boolean);
+        for(var i=0;i<lines.length;i++){if(/^[^\s\/]+\.[A-Za-z0-9]{1,8}$/.test(lines[i])) return lines[i];}
+        return lines[0]||'file';
+      }
+      var allAtt=[].slice.call(scope.querySelectorAll(ATT));
+      var units=scope.querySelectorAll('div[class*="hatch-agent-bubble-bg"],'+ATT);
+      var items=[];
+      for(var i=0;i<units.length;i++){
+        var u=units[i];
+        if(inUser(u)) continue;
+        if(u.matches(ATT)){
+          if(u.querySelector('img,video')&&!/\.[A-Za-z0-9]{1,8}\s*$/.test((u.innerText||'').trim())) continue;
+          items.push({k:'f',name:nameOf(u),idx:allAtt.indexOf(u)});
+        }else if(!u.closest(ATT)){
+          var t=conv(u).replace(/\n{3,}/g,NL+NL).trim();
+          if(t) items.push({k:'t',v:t});
+        }
+      }
+      return JSON.stringify(items);
+    })()"""
+
+    def _poll_turn(self) -> list[dict]:
+        try:
+            raw = self.page.js(self._TURN_JS)
+            return json.loads(raw) if raw else []
+        except Exception:  # noqa: BLE001
+            return []
+
+    _ATT_ACTION_JS = r"""(function(i, step){
+      var ATT='[data-testid^="hatch-chat-attachment-presentation-"]';
+      var n=document.querySelectorAll(ATT)[i]; if(!n) return 'none';
+      var root=n.closest('[class*="group/widget-presentation"]')||n;
+      var DL=/下载|保存|download/i;
+      function label(x){return (x.getAttribute('aria-label')||x.innerText||'').trim();}
+      var btns=[].slice.call(root.querySelectorAll('button,[role=button]'));
+      if(step==='direct'){
+        var a=root.querySelector('a[href]');
+        if(a&&a.href&&a.href.indexOf('javascript')!==0) return JSON.stringify({href:a.href});
+        var b=btns.find(function(x){return DL.test(label(x));});
+        if(b){b.click();return 'clicked';}
+        var m=btns.find(function(x){return /更多|more|options|菜单|menu/i.test(label(x));})||btns[btns.length-1];
+        if(m){m.click();return 'menu';}
+        return 'none';
+      }
+      var items=[].slice.call(document.querySelectorAll('[role=menuitem],[role=option],[role=menu] button,[role=menu] div'));
+      var it=items.find(function(x){return DL.test((x.innerText||'').trim())&&(x.innerText||'').length<30;});
+      if(it){it.click();return 'clicked';}
+      return 'none';
+    })(%d, %s)"""
+
+    def _fetch_attachment(self, idx: int, name: str, timeout: float = 60.0):
+        """取回聊天里第 idx 个文件卡片的内容，失败返回 None。"""
+        try:
+            before = set(os.listdir(self.cfg.download_dir))
+            res = self.page.js(self._ATT_ACTION_JS % (idx, '"direct"'))
+            if res == "menu":
+                time.sleep(0.5)
+                res = self.page.js(self._ATT_ACTION_JS % (idx, '"menu"'))
+            if res and res not in ("none", "clicked", "menu"):
+                href = json.loads(res).get("href")
+                if href:
+                    raw = self.page.js(self._EXTRACT_JS % (json.dumps(href), json.dumps("file")),
+                                       await_promise=True, timeout=120)
+                    info = json.loads(raw) if isinstance(raw, str) else raw
+                    if info.get("ok"):
+                        return base64.b64decode(info["b64"])
+                    return None
+            if res != "clicked":
+                return None
+            t_end = time.time() + timeout
+            while time.time() < t_end:
+                time.sleep(0.8)
+                new = [f for f in (set(os.listdir(self.cfg.download_dir)) - before)
+                       if not f.endswith(".crdownload")]
+                if new:
+                    p = os.path.join(self.cfg.download_dir, max(
+                        new, key=lambda f: os.path.getmtime(os.path.join(self.cfg.download_dir, f))))
+                    if os.path.getsize(p) > 0:
+                        with open(p, "rb") as f:
+                            data = f.read()
+                        os.unlink(p)
+                        return data
+        except Exception as exc:  # noqa: BLE001
+            log.warning("取回附件 %s 失败: %s", name, exc)
+        return None
+
+    def _report_turn(self, on_turn, base: int):
+        """回复结束后取出这一轮的所有气泡/文件，文件内容一并取回，交给 on_turn。"""
+        if on_turn is None:
+            return
+        time.sleep(0.4)
+        items = self._poll_turn()[base:]
+        for it in items:
+            if it.get("k") == "f":
+                it["data"] = self._fetch_attachment(it["idx"], it["name"])
+        if items:
+            on_turn(items)
+
     def _report_options(self, on_options):
         if on_options is None:
             return
@@ -1059,23 +1290,24 @@ class MuseEngine:
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, main_chat: bool = False,
                     fallback_prompt: str | None = None, on_options=None,
-                    on_prompt=None):
+                    on_prompt=None, on_turn=None):
         """发一条消息，流式 yield 增量文本。
 
         main_chat=True 时发到「主要聊天」，只发 prompt（muse 自己记得上下文）；
         进不去时回退为新会话，并改发 fallback_prompt（带历史的完整提示词）。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
+        fresh = False
         if main_chat:
             self.reset_thread(for_chat=True, keep_page=True)
-            if not self.open_main_chat():
-                self.reset_thread(for_chat=True)
-                if fallback_prompt:
-                    prompt = fallback_prompt
+            prompt, fresh = self._enter_chat(account_id, prompt, fallback_prompt)
         else:
             self.reset_thread(for_chat=True)
         base_agent, base_text, _ = self._poll_chat()
+        base_turn = len(self._poll_turn()) if on_turn is not None else 0
         self._send(prompt)
+        if main_chat and fresh:
+            self._remember_thread(account_id)
 
         t_sent = time.time()
         deadline = t_sent + timeout
@@ -1083,6 +1315,7 @@ class MuseEngine:
         sent, last, stable = "", None, 0
         got_first = False
         last_dlg = [0.0]
+        last_cnt = -1
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
@@ -1129,6 +1362,8 @@ class MuseEngine:
             if not cur:
                 continue
 
+            if on_turn is not None and cnt != last_cnt:
+                last_cnt, stable = cnt, 0
             if cur != last:
                 delta = cur[len(sent):] if cur.startswith(sent) else cur
                 if delta:
@@ -1140,10 +1375,12 @@ class MuseEngine:
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
                     self._report_options(on_options)
+                    self._report_turn(on_turn, base_turn)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
+                if has_stop and stable >= (600 if on_turn is not None else 80):
                     self._report_options(on_options)
+                    self._report_turn(on_turn, base_turn)
                     return
 
         raise MuseGenerationError("等待助手回复超时")

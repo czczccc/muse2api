@@ -151,7 +151,7 @@ class ILinkClient:
             last = f"HTTP {r.status_code}"
         raise RuntimeError(f"CDN 上传失败: {last}")
 
-    def send_media(self, to_user: str, data: bytes, kind: str, context_token: str):
+    def send_media(self, to_user: str, data: bytes, kind: str, context_token: str, name: str = ""):
         up = self.upload_media(data, kind, to_user)
         media = {"encrypt_query_param": up["param"],
                  "aes_key": base64.b64encode(up["aeskey"].encode()).decode(), "encrypt_type": 1}
@@ -159,6 +159,10 @@ class ILinkClient:
             item = {"type": ITEM_TYPE["image"], "image_item": {"media": media, "mid_size": up["size"]}}
         elif kind == "video":
             item = {"type": ITEM_TYPE["video"], "video_item": {"media": media, "video_size": up["size"]}}
+        elif kind == "file":
+            item = {"type": ITEM_TYPE["file"],
+                    "file_item": {"media": media, "file_name": name or "file",
+                                  "len": str(len(data))}}
         else:
             raise ValueError(kind)
         self._send(to_user, item, context_token)
@@ -356,7 +360,8 @@ class WeixinBot:
                     client.send_text(user, r[1], ctx)
                 else:
                     with open(r[1], "rb") as f:
-                        client.send_media(user, f.read(), r[2], ctx)
+                        client.send_media(user, f.read(), r[2], ctx,
+                                          name=os.path.basename(r[1]))
             except Exception as exc:  # noqa: BLE001
                 log.warning("微信发送失败: %s", exc)
                 self.last_error = str(exc)[:200]

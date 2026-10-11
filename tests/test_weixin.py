@@ -73,8 +73,8 @@ def test_login_and_chat():
                                msg(3, "me@im.wechat", "群里", group="g1")]]  # 群消息
         assert bot.poll_login()["status"] == "none"
         assert bot.status == "connected" and bot.allow_list() == ["me@im.wechat"]
-        for _ in range(60):
-            if FakeClient.sent:
+        for _ in range(100):
+            if FakeClient.sent and bot.state.get("updates_buf") == "B2":
                 break
             time.sleep(0.05)
         bot.stop()
@@ -86,6 +86,34 @@ def test_login_and_chat():
         assert saved.status == "disconnected" and "bot_token" not in saved.state
     finally:
         W.ILinkClient = W.ILinkClient_real
+
+
+def test_send_file_item():
+    class R:
+        def __init__(s, code=200, js=None, h=None):
+            s.status_code, s._js, s.headers, s.content, s.text = code, js, h or {}, b"1", ""
+
+        def json(s):
+            return s._js
+
+        def raise_for_status(s):
+            pass
+    bodies = []
+
+    class Sess:
+        def post(s, url, json=None, data=None, headers=None, timeout=None):
+            if "getuploadurl" in url:
+                return R(js={"upload_full_url": "https://cdn/up?x=1"})
+            if url.startswith("https://cdn"):
+                return R(h={"x-encrypted-param": "DL"})
+            bodies.append(json)
+            return R(js={"ret": 0})
+    c = W.ILinkClient(token="t", session=Sess())
+    c.send_media("u@im.wechat", b"print(1)\n", "file", "CT", name="hello_world.py")
+    item = bodies[-1]["msg"]["item_list"][0]
+    assert item["type"] == 4
+    assert item["file_item"]["file_name"] == "hello_world.py" and item["file_item"]["len"] == "9"
+    assert item["file_item"]["media"]["encrypt_query_param"] == "DL"
 
 
 def test_expired_session():
@@ -108,5 +136,6 @@ def test_expired_session():
 if __name__ == "__main__":
     test_helpers()
     test_login_and_chat()
+    test_send_file_item()
     test_expired_session()
     print("weixin tests OK")
